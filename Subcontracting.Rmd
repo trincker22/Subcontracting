@@ -55,7 +55,6 @@ NAICS <- read_excel(here("NAICS.xlsx"))
  #       mutate(year = year(date(prime_date)))
 
 
-
 # twos <- sub %>% 
 #   select(product_or_service_code_descript, subaward_description, naics_title, prime_id_num)
 
@@ -133,6 +132,8 @@ scale_color_wrapped <- scale_color_discrete(labels = ~ wrap_legend(.x, 28))
 scale_fill_wrapped  <- scale_fill_discrete(labels  = ~ wrap_legend(.x, 28))
 
 ```
+##Data Visualization
+
 
 ```{r}
 
@@ -334,179 +335,243 @@ ggplot(size_vs_count, aes(x = num_contracts, y = total_value)) +
 
 ```
 
+# LLM Section
+
+There are two prompts that follow a similar workflow. The first uses LLM to translate codes in the subcontractors description into readable text. For example, quite often there will just be a description like IGF::OT::IGF, which, if you look in the DoD handbook, signifies "Inherently Governmental Functions: Other functions." The idea is that the LLM will translate these acronyms or codes instead of doing it by hand, which would be quite time intensive. The second prompt classifies the relationship between the primary contract category and the specific description of the contract given by the subcontractors. 
+
+First, I construct a safe call function, which limits the frequency of LLM queries so that we do not repeatedly hit quotas. When it fails, it adds sleep time as powers of 2, increasing with the number of failed tries. Next, because we ask the LLM to return output in JSON format, the JSON parser uses regex to crop out only the text that fits the variables we define. (For ex., it will remove "Sure, the readable text is below!" from the output). It gives a try-error if the output cannot be parsed into JSON, which will also be flagged as F under the parsed_ok variable. If any columns of the tibble built off of the JSON structure are missing, another function will fill with NAs. This all helps to identify failures. 
+
+Next, the batch runner works for both prompts. It creates batches size 20 (the number of inputs before the output tibble is saved to checkpoint), and runs each row in the batch through all of the functions above. The output has 5 columns: the observation id, the raw JSON output from the LLM, the parsed output as returned_text, a flag indicating whether the parsing was successful, and notes from the LLM about why it made its decision (people report that LLMs have better accuracy when you ask them to justify their decisions). 
+
+These functions let you run the data in chunks. So, you generate the needs_readable df, which is (all observations) - (previously processed obs), identified by the observation id, NOT ROW INDEX (which can change). then it will run the llm over the needs_readable, it will join these results in with your existing processed output as readable_all, and these will overwrite your original file with the new LLM variables, matched by observation id. The structure is the same for the relation prompt run, the dfs just have different names. In the end, both runs write into their own checkpoint files, and their final results into contracts. 
+
+
 ```{r}
 
 chat <- ellmer::chat_google_gemini()
 
-contracts <- sub %>% 
-  mutate( 
-    obs_id = prime_id_num, 
-    broad_cat = product_or_service_code_descript, 
-    specific_desc = subaward_description, 
-    naics = naics_title
-    ) %>% 
-  select(obs_id, broad_cat, specific_desc, naics)
+contracts <- sub %>%
+  mutate(
+    obs_id        = as.character(prime_id_num),
+    broad_cat     = product_or_service_code_descript,
+    specific_desc = subaward_description,
+    naics         = naics_title
+  ) %>%
+  select(obs_id, broad_cat, specific_desc, naics) %>%
+  distinct(obs_id, .keep_all = TRUE)
 
+# prompts
 prompt_readable <- function(broad, specific) {
   glue(
-"{{
-  \"task\": \"rewrite_to_plain_english\",
-  \"schema\": {{
-    \"returned_text\": \"string\",
-    \"notes\": \"string\"
-  }},
-  \"instructions\": \"You are given a general contract category and a specific subaward description. 
-  If the description is already human-readable, return it unchanged. 
-  If it is code-like or obscure, return a brief plain-English description. 
-  Be conservative: no hallucinated details; if in doubt, summarize functionally.\",
-  \"category\": \"{broad}\",
-  \"description\": \"{specific}\",
-  \"output_format\": \"JSON with fields returned_text, notes\"
-}}")
+    "{{\n  \"task\": \"rewrite_to_plain_english\",\n  \"schema\": {{\n    \"returned_text\": \"string\",\n    \"notes\": \"string\"\n  }},\n  \"instructions\": \"You are given a general contract category and a specific subaward description. If the description is already human-readable, return it unchanged. If it is code-like or obscure, return a brief plain-English description. Be conservative: no hallucinated details; if in doubt, summarize functionally.\",\n  \"category\": \"{broad}\",\n  \"description\": \"{specific}\",\n  \"output_format\": \"JSON with fields returned_text, notes\"\n}}"
+  )
 }
 
 prompt_relation <- function(broad, specific) {
   glue(
-"{{
-  \"task\": \"relation_classification\",
-  \"schema\": {{
-    \"relation\": \"enum[same, subset, unrelated, unclear]\",
-    \"rationale\": \"string\"
-  }},
-  \"instructions\": \"Classify the relationship between the broad category and the subtask.
-   same = equivalent meaning; subset = subtask is a specialization of the category;
-   unrelated = different domains; unclear = insufficient info.\",
-  \"category\": \"{broad}\",
-  \"subtask\": \"{specific}\",
-  \"output_format\": \"JSON with fields relation, rationale\"
-}}")
+    "{{\n  \"task\": \"relation_classification\",\n  \"schema\": {{\n    \"relation\": \"enum[same, subset, unrelated, unclear]\",\n    \"rationale\": \"string\"\n  }},\n  \"instructions\": \"Classify the relationship between the broad category and the subtask. same = equivalent meaning; subset = subtask is a specialization of the category; unrelated = different domains; unclear = insufficient info.\",\n  \"category\": \"{broad}\",\n  \"subtask\": \"{specific}\",\n  \"output_format\": \"JSON with fields relation, rationale\"\n}}"
+  )
 }
 
 
+#-------------------------------------------------
+# Builder Functions
+#-------------------------------------------------
+
+# LLM Caller with exponential sys sleep 
 call_chat_safe <- function(prompt, max_tries = 5, base_sleep = 2) {
   for (i in seq_len(max_tries)) {
-    out <- try(chat$chat(prompt), silent = TRUE)
-    if (!inherits(out, "try-error") && is.character(out) && nchar(out) > 0) return(out)
-    Sys.sleep(base_sleep * (2^(i-1)) + runif(1, 0, 0.5))
+    txt <- try({
+      captured <- paste(utils::capture.output(res <- chat$chat(prompt)), collapse = "\n")
+      out <- if (is.character(res) && nzchar(res)) res else captured
+      out
+    }, silent = TRUE)
+    if (!inherits(txt, "try-error") && is.character(txt) && nzchar(txt)) return(txt)
+    Sys.sleep(base_sleep * (2^(i - 1)) + runif(1, 0, 0.5))
   }
   NA_character_
 }
 
+# JSON Parser
 parse_json_relaxed <- function(txt) {
-  if (is.na(txt)) return(tibble::tibble(parsed_ok = FALSE))
-  m <- str_match(txt, "\\{[\\s\\S]*\\}$")
-  json_txt <- if (!is.na(m[,1])) m[,1] else txt
+  if (is.na(txt)) return(tibble(parsed_ok = FALSE))
+
+  m1 <- stringr::str_match(txt, "(?s)```(?:json)?\\s*(\\{[\\s\\S]*?\\})\\s*```")
+  if (!is.na(m1[, 2])) {
+    json_txt <- m1[, 2]
+  } else {
+    m2 <- stringr::str_match_all(txt, "\\{[\\s\\S]*?\\}")
+    if (length(m2) && nrow(m2[[1]]) > 0) json_txt <- tail(m2[[1]][, 1], 1) else json_txt <- txt
+  }
+
   out <- try(jsonlite::fromJSON(json_txt), silent = TRUE)
-  if (inherits(out, "try-error")) tibble(parsed_ok = FALSE) else cbind(parsed_ok = TRUE, as_tibble(out))
+  if (inherits(out, "try-error")) tibble(parsed_ok = FALSE)
+  else dplyr::bind_cols(tibble(parsed_ok = TRUE), tibble::as_tibble(out))
 }
 
-# batch runner
+# NA if cols missing
+ensure_cols <- function(df, cols) {
+  missing <- setdiff(cols, names(df))
+  for (nm in missing) df[[nm]] <- NA_character_
+  df
+}
+
+#  Batch runner
 run_llm_over_df <- function(df, broad_col, specific_col,
                             which_prompt = c("readable", "relation"),
                             batch_size = 20,
                             checkpoint_path = NULL,
-                            temperature = 0.0) {
+                            temperature = 0.0, # max determinism parameter in LLM
+                            verbose = TRUE) {
   which_prompt <- match.arg(which_prompt)
+  df <- df %>% mutate(obs_id = as.character(.data[["obs_id"]]))
+  n <- nrow(df)
+  if (n == 0) return(tibble())
 
-
-  idx <- split(seq_len(nrow(contracts)), ceiling(seq_along(seq_len(nrow(contracts))) / batch_size))
-
+  idx <- split(seq_len(n), ceiling(seq_along(seq_len(n)) / batch_size))
   results <- vector("list", length(idx))
-  for (bi in seq_along(idx)) {
-    rows <- contracts[idx[[bi]], ]
 
-    # build prompts and call
-    prompts <- pmap(rows, function(obs_id, ...) {
-      broad <- rows[[broad_col]][rows$obs_id == obs_id]
-      spec  <- rows[[specific_col]][rows$obs_id == obs_id]
+  for (bi in seq_along(idx)) {
+    rows <- df[idx[[bi]], , drop = FALSE]
+
+    rows_small <- tibble::tibble(
+      obs_id = rows$obs_id,
+      broad  = rows[[broad_col]],
+      spec   = rows[[specific_col]]
+    )
+
+    prompts <- purrr::pmap(rows_small, function(obs_id, broad, spec) {
       if (which_prompt == "readable") prompt_readable(broad, spec) else prompt_relation(broad, spec)
     })
 
-    raw <- map(prompts, ~ call_chat_safe(.x))
+    raw    <- purrr::map(prompts, ~ call_chat_safe(.x))
+    parsed <- purrr::map_dfr(raw, parse_json_relaxed)
 
-    parsed <- map_dfr(raw, parse_json_relaxed)
-
-    out <- tibble(
+    out <- tibble::tibble(
       obs_id = rows$obs_id,
-      raw = raw
-    ) %>%
-      bind_cols(parsed)
+      raw    = unlist(raw, use.names = FALSE)
+    ) %>% dplyr::bind_cols(parsed)
 
     results[[bi]] <- out
 
-    # checkpoint
-    if (!is.null(checkpoint_path) && (bi %% 5 == 0 || bi == length(idx))) {
-      write_rds(bind_rows(results[seq_len(bi)]), checkpoint_path)
+    if (!is.null(checkpoint_path)) {
+      readr::write_rds(dplyr::bind_rows(results[seq_len(bi)]), checkpoint_path)
+      if (verbose) message(glue("[{bi}/{length(idx)}] wrote checkpoint: {checkpoint_path} (rows so far: {nrow(dplyr::bind_rows(results[seq_len(bi)]))})"))
     }
   }
-  bind_rows(results)
+
+  dplyr::bind_rows(results)
 }
 
 
-if (file.exists(here("readable_checkpoint.rds"))) {
-  prev_readable <- read_rds(here("readable_checkpoint.rds"))
-} else {
-  prev_readable <- tibble(obs_id = double())
+#-------------------------------------------------
+# Initializing Checkpoint Files
+#-------------------------------------------------
+
+readable_ckpt <- here::here("Checkpoints/readable_checkpoint.rds")
+relation_ckpt <- here::here("Checkpoints/relation_checkpoint.rds")
+
+if (!file.exists(readable_ckpt)) {
+  write_rds(
+    tibble(
+      obs_id        = character(),
+      raw           = character(),
+      parsed_ok     = logical(),
+      returned_text = character(),
+      notes         = character()
+    ),
+    readable_ckpt
+  )
 }
 
-needs_readable <- anti_join(
-  contracts %>% select(obs_id, broad_cat, specific_desc),
-  prev_readable %>% select(obs_id),
-  by = c("obs_id")
+if (!file.exists(relation_ckpt)) {
+  write_rds(
+    tibble(
+      obs_id    = character(),
+      raw       = character(),
+      parsed_ok = logical(),
+      relation  = character(),
+      rationale = character()
+    ),
+    relation_ckpt
+  )
+}
+
+prev_readable <- read_rds(readable_ckpt)
+prev_rel      <- read_rds(relation_ckpt)
+
+prev_readable <- if (file.exists(readable_ckpt)) readr::read_rds(readable_ckpt) else tibble(obs_id = character())
+prev_rel      <- if (file.exists(relation_ckpt)) readr::read_rds(relation_ckpt) else tibble(obs_id = character())
+
+
+#-------------------------------------------------
+# Run Readable, then Relation
+#-------------------------------------------------
+
+needs_readable <- dplyr::anti_join(
+  contracts %>% dplyr::select(obs_id, broad_cat, specific_desc),
+  prev_readable %>% dplyr::select(obs_id),
+  by = "obs_id"
 )
-
 
 readable_new <- if (nrow(needs_readable) > 0) {
   run_llm_over_df(
-    needs_readable, "broad_cat", "specific_desc",
+    df = needs_readable,
+    broad_col = "broad_cat",
+    specific_col = "specific_desc",
     which_prompt = "readable",
     batch_size = 20,
-    checkpoint_path = "readable_checkpoint.rds"
+    checkpoint_path = readable_ckpt,
+    verbose = TRUE
   )
 } else tibble()
 
-readable_all <- bind_rows(
-  prev_readable,
-  readable_new
-) %>% distinct(obs_id, .keep_all = TRUE)
+readable_all <- dplyr::bind_rows(prev_readable, readable_new) %>%
+  dplyr::distinct(obs_id, .keep_all = TRUE) %>%
+  ensure_cols(c("returned_text", "notes"))
 
 contracts <- contracts %>%
-  left_join(
+  dplyr::left_join(
     readable_all %>%
-      transmute(obs_id, readable_text = coalesce(returned_text, NA_character_), readable_notes = notes %||% NA_character_),
+      dplyr::transmute(
+        obs_id,
+        readable_text  = dplyr::coalesce(returned_text, NA_character_),
+        readable_notes = dplyr::coalesce(notes,         NA_character_)
+      ),
     by = "obs_id"
   )
 
-if (file.exists(here("relation_checkpoint.rds"))) {
-  prev_rel <- read_rds(here("relation_checkpoint.rds"))
-} else {
-  prev_rel <- tibble(obs_id = character())
-}
-
-needs_rel <- anti_join(
-  contracts %>% select(obs_id, broad_cat, specific_desc),
-  prev_rel %>% select(obs_id),
-  by = c("obs_id")
+# ---- RELATION
+needs_rel <- dplyr::anti_join(
+  contracts %>% dplyr::select(obs_id, broad_cat, specific_desc),
+  prev_rel %>% dplyr::select(obs_id),
+  by = "obs_id"
 )
 
 rel_new <- if (nrow(needs_rel) > 0) {
   run_llm_over_df(
-    needs_rel, "broad_cat", "specific_desc",
+    df = needs_rel,
+    broad_col = "broad_cat",
+    specific_col = "specific_desc",
     which_prompt = "relation",
     batch_size = 20,
-    checkpoint_path = here("relation_checkpoint.rds")
+    checkpoint_path = relation_ckpt,
+    verbose = TRUE
   )
 } else tibble()
 
-rel_all <- bind_rows(prev_rel, rel_new) %>% distinct(obs_id, .keep_all = TRUE)
+rel_all <- dplyr::bind_rows(prev_rel, rel_new) %>%
+  dplyr::distinct(obs_id, .keep_all = TRUE) %>%
+  ensure_cols(c("relation", "rationale"))
 
 contracts <- contracts %>%
-  left_join(
-    rel_all %>% transmute(
-      obs_id,
-      relation = ifelse(parsed_ok, relation, NA_character_),
-      relation_rationale = ifelse(parsed_ok, rationale, NA_character_)
-    ),
+  dplyr::left_join(
+    rel_all %>%
+      dplyr::transmute(
+        obs_id,
+        relation            = ifelse(parsed_ok, relation,  NA_character_),
+        relation_rationale  = ifelse(parsed_ok, rationale, NA_character_)
+      ),
     by = "obs_id"
   )
 
@@ -523,4 +588,3 @@ contracts <- contracts %>%
 
 ```
 
-\`\`\`{r}
