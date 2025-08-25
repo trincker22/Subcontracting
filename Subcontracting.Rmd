@@ -4,17 +4,13 @@ output: html_document
 date: "2025-08-15"
 ---
 
-
-
 ```{r}
 rm(list = ls())
 
 
 ```
 
-
 ```{r setup, include=FALSE}
-
 
 library(tidyverse)
 library(haven)
@@ -37,16 +33,13 @@ library(data.table)
 library(e1071)
 library(randomForest)
 library(glmnet)
-library(ellmer)
-library(purrr)
 library(stringr)
 library(glue)
 library(digest)
-library(readr)    
 library(tibble)
 library(uuid)
-library(ellmer)
-library(here)
+library(scales)
+
 options(scipen = 999)
 
 sub <- read_rds(here("subcontracts.RDS"))
@@ -54,9 +47,9 @@ sub <- read_rds(here("subcontracts.RDS"))
 NAICS <- read_excel(here("NAICS.xlsx"))
 
 
-sub <- left_join(sub, NAICS, 
-       join_by(naics_code)) %>% 
-       mutate(year = year(date(prime_date)))
+ # sub <- left_join(sub, NAICS, 
+ #       join_by(naics_code)) %>% 
+ #       mutate(year = year(date(prime_date)))
 
 
 
@@ -66,13 +59,7 @@ twos <- sub %>%
 
 ```
 
-
 ```{r}
-
-
-# ----------------------------------------------------
-# Data Prep
-# ----------------------------------------------------
 
 summary_data_all <- sub %>%
   group_by(year, naics_code) %>%
@@ -80,15 +67,13 @@ summary_data_all <- sub %>%
     num_contracts = n(),
     avg_contract_value = mean(nom_g, na.rm = TRUE),
     total_contract_value = sum(nom_g, na.rm = TRUE),
-    .groups = 'drop'
+    .groups = "drop"
   ) %>%
-  left_join(NAICS %>%
-              select(naics_code, naics_title),
-            join_by(naics_code))
+  left_join(NAICS %>% select(naics_code, naics_title), join_by(naics_code))
 
 top_5_naics_value <- summary_data_all %>%
   group_by(naics_title) %>%
-  summarize(total_value = sum(total_contract_value)) %>%
+  summarise(total_value = sum(total_contract_value), .groups = "drop") %>%
   arrange(desc(total_value)) %>%
   slice(1:5) %>%
   pull(naics_title)
@@ -96,145 +81,243 @@ top_5_naics_value <- summary_data_all %>%
 filtered_summary_top5_value <- summary_data_all %>%
   filter(naics_title %in% top_5_naics_value)
 
-
 grouped_data_for_shares <- summary_data_all %>%
   mutate(naics_group = ifelse(naics_title %in% top_5_naics_value, naics_title, "Other")) %>%
   group_by(year, naics_group) %>%
   summarise(
-    num_contracts_grouped = sum(num_contracts), # Use sum(num_contracts) here
-    total_contract_value_grouped = sum(total_contract_value), # Use sum(total_contract_value) here
-    .groups = 'drop'
+    num_contracts_grouped = sum(num_contracts),
+    total_contract_value_grouped = sum(total_contract_value),
+    .groups = "drop"
   )
-
 
 yoy_change_data <- filtered_summary_top5_value %>%
   group_by(naics_title) %>%
-  arrange(year) %>%
+  arrange(year, .by_group = TRUE) %>%
   mutate(
-    yoy_num_contracts = ((num_contracts - lag(num_contracts)) / lag(num_contracts)) * 100,
-    yoy_total_contract_value = ((total_contract_value - lag(total_contract_value)) / lag(total_contract_value)) * 100
+    yoy_num_contracts = 100 * (num_contracts / lag(num_contracts) - 1),
+    yoy_total_contract_value = 100 * (total_contract_value / lag(total_contract_value) - 1)
   ) %>%
   ungroup()
 
-# ----------------------------------------------------
-# Plotting 
-# ----------------------------------------------------
-
-sub %>%
+overall <- sub %>%
   group_by(year) %>%
-  count() %>%
-  ggplot(aes(x = year, y = n)) +
+  summarise(
+    num_contracts = n(),
+    total_value   = sum(nom_g, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(year) %>%
+  mutate(
+    yoy_num = 100 * (num_contracts / lag(num_contracts) - 1),
+    yoy_val = 100 * (total_value   / lag(total_value)   - 1)
+  )
+
+wrap_legend <- function(x, width = 28) stringr::str_wrap(x, width = width)
+legend_guide_bottom <- guides(color = guide_legend(nrow = 2, byrow = TRUE),
+                              fill  = guide_legend(nrow = 2, byrow = TRUE))
+theme_clean <- theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 10),
+        legend.text  = element_text(size = 9),
+        axis.text.x  = element_text(angle = 45, hjust = 1))
+scale_color_wrapped <- scale_color_discrete(labels = ~ wrap_legend(.x, 28))
+scale_fill_wrapped  <- scale_fill_discrete(labels  = ~ wrap_legend(.x, 28))
+
+```
+
+```{r}
+
+overall %>%
+  ggplot(aes(x = factor(year), y = num_contracts)) +
   geom_col() +
-  labs(
-    title = "Total Number of Contracts Per Year",
-    x = "Year",
-    y = "Number of Contracts"
-  ) +
-  theme_minimal()
+  labs(title = "Total Number of Contracts Per Year", x = "Year", y = "Number of Contracts") +
+  theme_clean
 
-sub %>% 
-  group_by(year) %>% 
-  summarise(value_year = sum(nom_g)) %>% 
-  ggplot(aes(x = factor(year), y = value_year)) +
-  geom_bar(stat= "identity") + 
-  labs(
-    title = "Total Value of Contracts Per Year",
-    x = "Year",
-    y = "Total Contract Value ($)"
-  ) +
-  scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) + # Format y-axis to billions
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
+```
+
+```{r}
+
+overall %>%
+  ggplot(aes(x = factor(year), y = total_value)) +
+  geom_col() +
+  scale_y_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  labs(title = "Total Value of Contracts Per Year", x = "Year", y = "Total Contract Value ($)") +
+  theme_clean
+
+
+```
+
+```{r}
+
+overall %>%
+  filter(!is.na(yoy_num)) %>%
+  ggplot(aes(x = year, y = yoy_num)) +
+  geom_line() + geom_point() +
+  scale_y_continuous(labels = label_percent(scale = 0.01)) +
+  scale_x_continuous(breaks = sort(unique(overall$year))) +
+  labs(title = "YoY Change: Number of Contracts (Overall)", x = "Year", y = "YoY %") +
+  theme_clean
+
+```
+
+```{r}
+
+overall %>%
+  filter(!is.na(yoy_val)) %>%
+  ggplot(aes(x = year, y = yoy_val)) +
+  geom_line() + geom_point() +
+  scale_y_continuous(labels = label_percent(scale = 0.01)) +
+  scale_x_continuous(breaks = sort(unique(overall$year))) +
+  labs(title = "YoY Change: Total Contract Value (Overall)", x = "Year", y = "YoY %") +
+  theme_clean
+
+```
+
+```{r}
 
 yoy_change_data %>%
-  filter(year > min(year)) %>% # Filter out the first year with NA YOY change
+  filter(year > min(year)) %>%
   ggplot(aes(x = year, y = yoy_num_contracts, color = naics_title, group = naics_title)) +
-  geom_line() +
-  geom_point() +
-  labs(
-    title = "Year-over-Year Percentage Change in Number of Contracts (Top 5 NAICS)",
-    x = "Year",
-    y = "Year-over-Year % Change",
-    color = "NAICS Industry Title"
-  ) +
-  theme_minimal() +
-  theme(legend.position = "bottom")
+  geom_line() + geom_point() +
+  scale_y_continuous(labels = label_percent(scale = 0.01)) +
+  scale_x_continuous(breaks = sort(unique(yoy_change_data$year))) +
+  labs(title = "YoY % Change in Number of Contracts — Top 5 NAICS",
+       x = "Year", y = "YoY %", color = "NAICS Industry Title") +
+  scale_color_wrapped + theme_clean + legend_guide_bottom
+
+```
+
+```{r}
 
 yoy_change_data %>%
-  filter(year > min(year)) %>% # Filter out the first year with NA YOY change
+  filter(year > min(year)) %>%
   ggplot(aes(x = year, y = yoy_total_contract_value, color = naics_title, group = naics_title)) +
+  geom_line() + geom_point() +
+  scale_y_continuous(labels = label_percent(scale = 0.01)) +
+  scale_x_continuous(breaks = sort(unique(yoy_change_data$year))) +
+  labs(title = "YoY % Change in Total Contract Value — Top 5 NAICS",
+       x = "Year", y = "YoY %", color = "NAICS Industry Title") +
+  scale_color_wrapped + theme_clean + legend_guide_bottom
+
+
+```
+
+```{r}
+
+ggplot(filtered_summary_top5_value,
+       aes(x = year, y = num_contracts, color = naics_title, group = naics_title)) +
+  geom_line() + geom_point() +
+  scale_x_continuous(breaks = sort(unique(filtered_summary_top5_value$year))) +
+  labs(title = "Number of Contracts Over Time — Top 5 NAICS",
+       x = "Year", y = "Number of Contracts", color = "NAICS Industry Title") +
+  scale_color_wrapped + theme_clean + legend_guide_bottom
+
+
+```
+
+```{r}
+
+ggplot(filtered_summary_top5_value,
+       aes(x = year, y = avg_contract_value, color = naics_title, group = naics_title)) +
+  geom_line() + geom_point() +
+  scale_y_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  scale_x_continuous(breaks = sort(unique(filtered_summary_top5_value$year))) +
+  labs(title = "Average Contract Value Over Time — Top 5 NAICS",
+       x = "Year", y = "Average Contract Value", color = "NAICS Industry Title") +
+  scale_color_wrapped + theme_clean + legend_guide_bottom
+
+
+```
+
+```{r}
+
+ggplot(grouped_data_for_shares,
+       aes(x = factor(year), y = num_contracts_grouped, fill = naics_group)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Share of Contract Count by Year (Top 5 vs Other)",
+       x = "Year", y = "Share", fill = "NAICS Group") +
+  scale_fill_wrapped + theme_clean + legend_guide_bottom
+
+```
+
+```{r}
+
+ggplot(grouped_data_for_shares,
+       aes(x = factor(year), y = total_contract_value_grouped, fill = naics_group)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Share of Contract Value by Year (Top 5 vs Other)",
+       x = "Year", y = "Share", fill = "NAICS Group") +
+  scale_fill_wrapped + theme_clean + legend_guide_bottom
+
+```
+
+```{r}
+
+theme_clean <- theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 10),
+        legend.text  = element_text(size = 9),
+        axis.text.x  = element_text(angle = 45, hjust = 1))
+
+sub_prep <- sub %>%
+  mutate(prime_date = as.Date(prime_date),
+         year = year(prime_date))
+
+summary_data_all <- sub_prep %>%
+  group_by(year, naics_title) %>%
+  summarise(num_contracts = n(),
+            avg_contract_value = mean(nom_g, na.rm = TRUE),
+            total_contract_value = sum(nom_g, na.rm = TRUE),
+            .groups = "drop")
+
+hhi_by_year <- summary_data_all %>%
+  group_by(year, naics_title) %>%
+  summarise(val = sum(total_contract_value), .groups = "drop_last") %>%
+  mutate(year_total = sum(val),
+         share_pct = ifelse(year_total > 0, 100 * val / year_total, NA_real_)) %>%
+  summarise(HHI = sum(share_pct^2, na.rm = TRUE), .groups = "drop")
+
+ggplot(hhi_by_year, aes(x = year, y = HHI)) +
+  geom_line() + geom_point() +
+  labs(title = "Market Concentration (HHI) of Contract Value by Year",
+       x = "Year", y = "HHI (0–10,000)") +
+  theme_clean
+
+```
+
+```{r}
+
+monthly_series <- sub_prep %>%
+  mutate(month = floor_date(prime_date, "month")) %>%
+  group_by(month) %>%
+  summarise(total_value = sum(nom_g, na.rm = TRUE), .groups = "drop")
+
+ggplot(monthly_series, aes(x = month, y = total_value)) +
   geom_line() +
-  geom_point() +
-  labs(
-    title = "Year-over-Year Percentage Change in Contract Value (Top 5 NAICS)",
-    x = "Year",
-    y = "Year-over-Year % Change",
-    color = "NAICS Industry Title"
-  ) +
-  theme_minimal() +
-  theme(legend.position = "bottom")
+  scale_y_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  labs(title = "Monthly Total Contract Value Over Time",
+       x = "Month", y = "Total Contract Value") +
+  theme_clean
 
+```
 
-ggplot(filtered_summary_top5_value, aes(x = year, y = num_contracts, color = naics_title, group = naics_title)) +
-  geom_line() +
-  geom_point() +
-  labs(
-    title = "Number of Contracts for Top 5 NAICS Industries Over Time",
-    x = "Year",
-    y = "Number of Contracts",
-    color = "NAICS Industry Title"
-  ) +
-  theme_minimal() +
-  theme(legend.position = "bottom")
+```{r}
+size_vs_count <- summary_data_all %>%
+  group_by(naics_title) %>%
+  summarise(total_value = sum(total_contract_value, na.rm = TRUE),
+            num_contracts = sum(num_contracts, na.rm = TRUE),
+            .groups = "drop")
 
-
-ggplot(filtered_summary_top5_value, aes(x = year, y = avg_contract_value, color = naics_title, group = naics_title)) +
-  geom_line() +
-  geom_point() +
-  labs(
-    title = "Average Contract Value for Top 5 NAICS Industries Over Time",
-    x = "Year",
-    y = "Average Contract Value",
-    color = "NAICS Industry Title"
-  ) +
-  theme_minimal() +
-  theme(legend.position = "bottom")
-
-ggplot(grouped_data_for_shares, aes(x = factor(year), y = num_contracts_grouped, fill = naics_group)) +
-  geom_bar(stat = "identity", position = "fill") +
-  labs(
-    title = "Share of Contract Number by Year (Top 5 NAICS vs. Other)",
-    x = "Year",
-    y = "Share of Contracts",
-    fill = "NAICS Industry Group"
-  ) +
-  theme_minimal() +
-  theme(
-    legend.position = "bottom",
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  ) +
-  scale_fill_brewer(palette = "Paired") +
-  scale_y_continuous(labels = scales::percent)
-
-
-ggplot(grouped_data_for_shares, aes(x = factor(year), y = total_contract_value_grouped, fill = naics_group)) +
-  geom_bar(stat = "identity", position = "fill") +
-  labs(
-    title = "Share of Contract Value by Year (Top 5 NAICS vs. Other)",
-    x = "Year",
-    y = "Share of Contract Value",
-    fill = "NAICS Industry Group"
-  ) +
-  theme_minimal() +
-  theme(
-    legend.position = "bottom",
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  ) +
-  scale_fill_brewer(palette = "Paired") +
-  scale_y_continuous(labels = scales::percent)
-
-
+ggplot(size_vs_count, aes(x = num_contracts, y = total_value)) +
+  geom_point(alpha = 0.7) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  labs(title = "Contracts: Count vs Total Value by NAICS (All Years)",
+       x = "Number of Contracts", y = "Total Contract Value") +
+  theme_clean
 
 ```
 
@@ -427,5 +510,4 @@ contracts <- contracts %>%
 
 ```
 
-```{r}
-
+\`\`\`{r}
