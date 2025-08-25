@@ -42,7 +42,10 @@ library(scales)
 
 options(scipen = 999)
 
-sub <- read_rds(here("subcontracts.RDS"))
+# sub <- read_dta("M:/Xiaoqing/Subcontracting/forNLP.dta")
+# subcontracts <- read_dta("M:/Xiaoqing/Subcontracting/forNLP_2.dta")
+# saveRDS(subcontracts, "subcontracts.RDS")
+# sub <- read_rds(here("subcontracts.RDS"))
 
 NAICS <- read_excel(here("NAICS.xlsx"))
 
@@ -53,10 +56,17 @@ NAICS <- read_excel(here("NAICS.xlsx"))
 
 
 
-twos <- sub %>% 
-  select(product_or_service_code_descript, subaward_description, naics_title, prime_id_num)
+# twos <- sub %>% 
+#   select(product_or_service_code_descript, subaward_description, naics_title, prime_id_num)
 
+sub <- sub %>%  
+  group_by(prime_id) %>% 
+  slice_head(n=1) %>% 
+  ungroup()
 
+sub <- sub %>% 
+  mutate(year = year(date(prime_date))) %>% 
+  left_join(NAICS %>% select(naics_code, naics_title), join_by(naics_code))
 ```
 
 ```{r}
@@ -67,8 +77,7 @@ summary_data_all <- sub %>%
     num_contracts = n(),
     avg_contract_value = mean(nom_g, na.rm = TRUE),
     total_contract_value = sum(nom_g, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
+    .groups = "drop") %>% 
   left_join(NAICS %>% select(naics_code, naics_title), join_by(naics_code))
 
 top_5_naics_value <- summary_data_all %>%
@@ -151,12 +160,12 @@ overall %>%
 ```{r}
 
 overall %>%
-  filter(!is.na(yoy_num)) %>%
+  filter(!is.na(yoy_num), year >2011) %>%
   ggplot(aes(x = year, y = yoy_num)) +
   geom_line() + geom_point() +
   scale_y_continuous(labels = label_percent(scale = 0.01)) +
   scale_x_continuous(breaks = sort(unique(overall$year))) +
-  labs(title = "YoY Change: Number of Contracts (Overall)", x = "Year", y = "YoY %") +
+  labs(title = "YoY Change: Number of Contracts", x = "Year", y = "YoY %") +
   theme_clean
 
 ```
@@ -164,12 +173,12 @@ overall %>%
 ```{r}
 
 overall %>%
-  filter(!is.na(yoy_val)) %>%
+  filter(!is.na(yoy_val), year >2011) %>%
   ggplot(aes(x = year, y = yoy_val)) +
   geom_line() + geom_point() +
   scale_y_continuous(labels = label_percent(scale = 0.01)) +
   scale_x_continuous(breaks = sort(unique(overall$year))) +
-  labs(title = "YoY Change: Total Contract Value (Overall)", x = "Year", y = "YoY %") +
+  labs(title = "YoY Change: Total Contract Value", x = "Year", y = "YoY %") +
   theme_clean
 
 ```
@@ -177,7 +186,7 @@ overall %>%
 ```{r}
 
 yoy_change_data %>%
-  filter(year > min(year)) %>%
+  filter(year > 2012) %>%
   ggplot(aes(x = year, y = yoy_num_contracts, color = naics_title, group = naics_title)) +
   geom_line() + geom_point() +
   scale_y_continuous(labels = label_percent(scale = 0.01)) +
@@ -191,7 +200,7 @@ yoy_change_data %>%
 ```{r}
 
 yoy_change_data %>%
-  filter(year > min(year)) %>%
+  filter(year > 2012) %>%
   ggplot(aes(x = year, y = yoy_total_contract_value, color = naics_title, group = naics_title)) +
   geom_line() + geom_point() +
   scale_y_continuous(labels = label_percent(scale = 0.01)) +
@@ -288,10 +297,14 @@ ggplot(hhi_by_year, aes(x = year, y = HHI)) +
 
 ```
 
+
+The HHI (Herfindahl-Hirschman Index) measures market concentration. HHI is the sum of each industry's % share*100, squared, for each year. If all the shares are small, nearing perfect competition, then the HHI will be close to 0 because the squared shares are very small. If one firm has 100% share, 100^2 will be 10,000, the max HHI value. Below 1,500 is considered not concentrated, while an HHI above 2500 is considered highly concentrated.
+We can see here that concentration has decreased since 2010, but largely has not been concentrated. This value only measures the concentration of industries within federal government contracts, it does not say anything about the firm composition within any given industry.  
+
 ```{r}
 
 monthly_series <- sub_prep %>%
-  mutate(month = floor_date(prime_date, "month")) %>%
+  mutate(month = floor_date(prime_date, "quarter")) %>%
   group_by(month) %>%
   summarise(total_value = sum(nom_g, na.rm = TRUE), .groups = "drop")
 
