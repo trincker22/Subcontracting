@@ -4,6 +4,20 @@ output: html_document
 date: "2025-08-15"
 ---
 
+
+To do: 
+
+READABLE
+First, sort out subaward descriptions that do not need further processing 
+Then, make a dictionary for abbreviations. Look for DoD specific, or use method to find definitions within corpus. 
+Can also make a list to identify problem ones to search up if it is relatively short. 
+Third, use NLP on remaining unreadable subaward description. 
+
+LDA- write a quick LDA + textplot to visualize unsupervised groupings. 
+
+CATEGORIZATION PROBLEM
+There are 183 categories that the 400k distinct subaward descriptions may fall into. Handcode, then run a categorization model.
+
 ```{r}
 rm(list = ls())
 
@@ -66,6 +80,8 @@ sub <- sub %>%
 twos <- sub %>% 
   select(product_or_service_code_descript, subaward_description, naics_title, prime_id_num)
 
+subcontracts <-subcontracts %>% 
+ left_join(NAICS %>% select(naics_code, naics_title), join_by(naics_code))
 
 sub <- sub %>% 
   mutate(year = year(date(prime_date))) %>% 
@@ -136,8 +152,8 @@ scale_color_wrapped <- scale_color_discrete(labels = ~ wrap_legend(.x, 28))
 scale_fill_wrapped  <- scale_fill_discrete(labels  = ~ wrap_legend(.x, 28))
 
 ```
-##Data Visualization
 
+##Data Visualization
 
 ```{r}
 
@@ -196,7 +212,7 @@ yoy_change_data %>%
   geom_line() + geom_point() +
   scale_y_continuous(labels = label_percent(scale = 0.01)) +
   scale_x_continuous(breaks = sort(unique(yoy_change_data$year))) +
-  labs(title = "YoY % Change in Number of Contracts — Top 5 NAICS",
+  labs(title = "YoY % Change in Number of Contracts, Top 5 NAICS",
        x = "Year", y = "YoY %", color = "NAICS Industry Title") +
   scale_color_wrapped + theme_clean + legend_guide_bottom
 
@@ -210,7 +226,7 @@ yoy_change_data %>%
   geom_line() + geom_point() +
   scale_y_continuous(labels = label_percent(scale = 0.01)) +
   scale_x_continuous(breaks = sort(unique(yoy_change_data$year))) +
-  labs(title = "YoY % Change in Total Contract Value — Top 5 NAICS",
+  labs(title = "YoY % Change in Total Contract Value, Top 5 NAICS",
        x = "Year", y = "YoY %", color = "NAICS Industry Title") +
   scale_color_wrapped + theme_clean + legend_guide_bottom
 
@@ -223,7 +239,7 @@ ggplot(filtered_summary_top5_value,
        aes(x = year, y = num_contracts, color = naics_title, group = naics_title)) +
   geom_line() + geom_point() +
   scale_x_continuous(breaks = sort(unique(filtered_summary_top5_value$year))) +
-  labs(title = "Number of Contracts Over Time — Top 5 NAICS",
+  labs(title = "Number of Contracts Over Time, Top 5 NAICS",
        x = "Year", y = "Number of Contracts", color = "NAICS Industry Title") +
   scale_color_wrapped + theme_clean + legend_guide_bottom
 
@@ -237,7 +253,7 @@ ggplot(filtered_summary_top5_value,
   geom_line() + geom_point() +
   scale_y_continuous(labels = label_number(scale_cut = cut_short_scale())) +
   scale_x_continuous(breaks = sort(unique(filtered_summary_top5_value$year))) +
-  labs(title = "Average Contract Value Over Time — Top 5 NAICS",
+  labs(title = "Average Contract Value Over Time Top 5 NAICS",
        x = "Year", y = "Average Contract Value", color = "NAICS Industry Title") +
   scale_color_wrapped + theme_clean + legend_guide_bottom
 
@@ -302,9 +318,7 @@ ggplot(hhi_by_year, aes(x = year, y = HHI)) +
 
 ```
 
-
-The HHI (Herfindahl-Hirschman Index) measures market concentration. HHI is the sum of each industry's % share*100, squared, for each year. If all the shares are small, nearing perfect competition, then the HHI will be close to 0 because the squared shares are very small. If one firm has 100% share, 100^2 will be 10,000, the max HHI value. Below 1,500 is considered not concentrated, while an HHI above 2500 is considered highly concentrated.
-We can see here that concentration has decreased since 2010, but largely has not been concentrated. This value only measures the concentration of industries within federal government contracts, it does not say anything about the firm composition within any given industry.  
+The HHI (Herfindahl-Hirschman Index) measures market concentration. HHI is the sum of each industry's % share\*100, squared, for each year. If all the shares are small, nearing perfect competition, then the HHI will be close to 0 because the squared shares are very small. If one firm has 100% share, 100\^2 will be 10,000, the max HHI value. Below 1,500 is considered not concentrated, while an HHI above 2500 is considered highly concentrated. We can see here that concentration has decreased since 2010, but largely has not been concentrated. This value only measures the concentration of industries within federal government contracts, it does not say anything about the firm composition within any given industry.
 
 ```{r}
 
@@ -315,9 +329,10 @@ monthly_series <- sub_prep %>%
 
 ggplot(monthly_series, aes(x = month, y = total_value)) +
   geom_line() +
+  geom_point()+
   scale_y_continuous(labels = label_number(scale_cut = cut_short_scale())) +
-  labs(title = "Monthly Total Contract Value Over Time",
-       x = "Month", y = "Total Contract Value") +
+  labs(title = "Quarterly Total Contract Value Over Time",
+       x = "Quarter", y = "Total Contract Value") +
   theme_clean
 
 ```
@@ -341,20 +356,29 @@ ggplot(size_vs_count, aes(x = num_contracts, y = total_value)) +
 
 # LLM Section
 
-There are two prompts that follow a similar workflow. The first uses LLM to translate codes in the subcontractors description into readable text. For example, quite often there will just be a description like IGF::OT::IGF, which, if you look in the DoD handbook, signifies "Inherently Governmental Functions: Other functions." The idea is that the LLM will translate these acronyms or codes instead of doing it by hand, which would be quite time intensive. The second prompt classifies the relationship between the primary contract category and the specific description of the contract given by the subcontractors. 
+There are two prompts that follow a similar workflow. The first uses LLM to translate codes in the subcontractors description into readable text. For example, quite often there will just be a description like IGF::OT::IGF, which, if you look in the DoD handbook, signifies "Inherently Governmental Functions: Other functions." The idea is that the LLM will translate these acronyms or codes instead of doing it by hand, which would be quite time intensive. The second prompt classifies the relationship between the primary contract category and the specific description of the contract given by the subcontractors.
 
-First, I construct a safe call function, which limits the frequency of LLM queries so that we do not repeatedly hit quotas. When it fails, it adds sleep time as powers of 2, increasing with the number of failed tries. Next, because we ask the LLM to return output in JSON format, the JSON parser uses regex to crop out only the text that fits the variables we define. (For ex., it will remove "Sure, the readable text is below!" from the output). It gives a try-error if the output cannot be parsed into JSON, which will also be flagged as F under the parsed_ok variable. If any columns of the tibble built off of the JSON structure are missing, another function will fill with NAs. This all helps to identify failures. 
+First, I construct a safe call function, which limits the frequency of LLM queries so that we do not repeatedly hit quotas. When it fails, it adds sleep time as powers of 2, increasing with the number of failed tries. Next, because we ask the LLM to return output in JSON format, the JSON parser uses regex to crop out only the text that fits the variables we define. (For ex., it will remove "Sure, the readable text is below!" from the output). It gives a try-error if the output cannot be parsed into JSON, which will also be flagged as F under the parsed_ok variable. If any columns of the tibble built off of the JSON structure are missing, another function will fill with NAs. This all helps to identify failures.
 
-Next, the batch runner works for both prompts. It creates batches size 20 (the number of inputs before the output tibble is saved to checkpoint), and runs each row in the batch through all of the functions above. The output has 5 columns: the observation id, the raw JSON output from the LLM, the parsed output as returned_text, a flag indicating whether the parsing was successful, and notes from the LLM about why it made its decision (people report that LLMs have better accuracy when you ask them to justify their decisions). 
+Next, the batch runner works for both prompts. It creates batches size 20 (the number of inputs before the output tibble is saved to checkpoint), and runs each row in the batch through all of the functions above. The output has 5 columns: the observation id, the raw JSON output from the LLM, the parsed output as returned_text, a flag indicating whether the parsing was successful, and notes from the LLM about why it made its decision (people report that LLMs have better accuracy when you ask them to justify their decisions).
 
-These functions let you run the data in chunks. So, you generate the needs_readable df, which is (all observations) - (previously processed obs), identified by the observation id, NOT ROW INDEX (which can change). then it will run the llm over the needs_readable, it will join these results in with your existing processed output as readable_all, and these will overwrite your original file with the new LLM variables, matched by observation id. The structure is the same for the relation prompt run, the dfs just have different names. In the end, both runs write into their own checkpoint files, and their final results into contracts. 
+These functions let you run the data in chunks. So, you generate the needs_readable df, which is (all observations) - (previously processed obs), identified by the observation id, NOT ROW INDEX (which can change). then it will run the llm over the needs_readable, it will join these results in with your existing processed output as readable_all, and these will overwrite your original file with the new LLM variables, matched by observation id. The structure is the same for the relation prompt run, the dfs just have different names. In the end, both runs write into their own checkpoint files, and their final results into contracts.
 
+There are major computational limitations. The Gemini API that I used here only takes 250 queries a day, even with aggressive batching (200 obs per query), it would take 8 days. Alternatively, I could try to run a "local" model using the remote computers or the BigTex computing. The problem is that these have CPUs, which are significantly slower than GPUs at this task. It is difficult to estimate the amount of time it would take on a CPU, but GPU can be estimated (probably a dayish? but would be paid)
+
+The cost of using a GPU depends on the number of tokens used, which determines the amount of time that the computation takes. The number of tokens depends on the length of the prompt, which depends on batch size. The batch size depends on the accuracy level of a given batch size. So in order to know for sure the cost of using a GPU, would have to test on a few batch sizes, which would be paid.
+
+**Alternatives** :
+
+The codes/acronyms issue can probably be solved without an LLM. There are dictionaries and methods for creating dictionaries with a large corpus (somewhere else in the corpus, there will be text like "Acronym Code (AC)"). But the relationship is more difficult. This is because in general, text based models can categorize a set of text in to groups, like in an LDA model, and then with supervised counterparts. So for example, if you treat each seperate word as its own variable and construct a matrix where the rows are the texts and the columns are the frecquences of each distinct word that appears in all of the texts, then you could regress on the words.
+
+So for ex., if you were categorizing news, then the words "football" and "player" would have large coefficients for the sports category. This is frequence based.
 
 ```{r}
 
 chat <- ellmer::chat_google_gemini()
 
-contracts <- sub %>%
+contracts <- subcontracts %>%
   mutate(
     obs_id        = as.character(prime_id_num),
     broad_cat     = product_or_service_code_descript,
@@ -591,4 +615,3 @@ contracts <- contracts %>%
 
 
 ```
-
