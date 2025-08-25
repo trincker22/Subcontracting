@@ -63,6 +63,10 @@ sub <- sub %>%
   slice_head(n=1) %>% 
   ungroup()
 
+twos <- sub %>% 
+  select(product_or_service_code_descript, subaward_description, naics_title, prime_id_num)
+
+
 sub <- sub %>% 
   mutate(year = year(date(prime_date))) %>% 
   left_join(NAICS %>% select(naics_code, naics_title), join_by(naics_code))
