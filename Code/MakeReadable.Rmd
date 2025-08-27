@@ -70,143 +70,171 @@ saveRDS(acr_tbl_split, here(dict_path))
 }
 
 
-names(contracts)
-
-
-
-
 ```
 
 # Build From Corpus 
 
+input is a vector called "texts" 
+
 ```{r}
+texts <- subcontract$subaward_description
+
+# Builder Functions
 
 catalog_markers <- c("PN","NSN","CLIN","NIIN","SDRL","FAI","MTBF","BOM","EOL","CAGE","P/N","S/N")
+# low-information words to ignore for initials
 connectors <- c("AND","OF","THE","FOR","IN","ON","WITH","TO","BY","AT","FROM","A","AN")
+
+# similarity threshold for collapsing expansions within an acronym
+JW_THRESH <- 0.93   # 0.93–0.96 is “tight”; raise to be stricter, lower to merge more
 
 
 looks_like_acronym <- function(acr) {
+  acr <- as.character(acr)
+  acr <- toupper(acr)
 
-  grepl("^[A-Z0-9][A-Z0-9&\\.\\-]{1,9}$", acr) &&
-    (str_count(acr, "[A-Z]") >= 2)
+  ok_shape      <- grepl("^[A-Z0-9][A-Z0-9&\\.\\-]{1,9}$", acr)
+  enough_letters<- stringr::str_count(acr, "[A-Z]") >= 2
+
+  ok <- ok_shape & enough_letters
+  ok[is.na(ok)] <- FALSE
+  ok
 }
 
 normalize_phrase <- function(x) {
   x %>%
     toupper() %>%
     str_replace_all("&", " AND ") %>%
-    str_replace_all("[ ]*/[ ]*", "/") %>%      # keep slashes tight
-    str_replace_all("[^A-Z0-9/ \\-]", " ") %>% # drop punct except / and -
+    str_replace_all("[ ]*/[ ]*", "/") %>%           # keep slashes tight (C/PD, C/S/A)
+    str_replace_all("[^A-Z0-9/ \\-]", " ") %>%      # drop other punct
     str_replace_all("\\s+", " ") %>%
     str_squish()
 }
 
-
-initials_from_phrase <- function(phrase, drop_words = connectors) {
-  p <- normalize_phrase(phrase)
-  toks <- unlist(str_split(p, "\\s+"))
-  toks <- toks[!(toks %in% drop_words)]
-  toks <- toks[nzchar(toks)]
-  if (length(toks) == 0) return(list(init = "", n_tokens = 0))
-  init <- paste0(substr(toks, 1, 1), collapse = "")
-  list(init = init, n_tokens = length(toks))
+# vectorized initials + token count (drops connector words)
+initials_from_phrase_vec <- function(phr, drop_words = connectors) {
+  p <- normalize_phrase(phr)
+  toks <- str_split(p, "\\s+")
+  n <- length(toks)
+  out_init <- character(n); out_ntok <- integer(n)
+  for (i in seq_len(n)) {
+    ti <- toks[[i]]
+    ti <- ti[!(ti %in% drop_words)]
+    ti <- ti[nzchar(ti)]
+    out_ntok[i] <- length(ti)
+    out_init[i] <- if (length(ti)) paste0(substr(ti, 1, 1), collapse = "") else ""
+  }
+  list(init = out_init, n_tokens = out_ntok)
 }
 
+# strip one leading connector phrase (AND/OR/THE/AND THE) before deduping
+strip_leading_connectors <- function(x) {
+  x %>%
+    toupper() %>%
+    str_squish() %>%
+    str_replace("^(?:AND THE|AND|OR|THE)\\s+", "")
+}
+
+
+normalize_exp_display <- function(x) {
+  x %>%
+    toupper() %>%
+    str_replace_all("[ ]*/[ ]*", " / ") %>%
+    str_replace_all("[ ]*-[ ]*", "-") %>%
+    str_replace_all("\\s+", " ") %>%
+    str_squish()
+}
+
+# regex extractors
 pat_exp_acr <- "(?<exp>[A-Za-z][A-Za-z0-9/&\\-\\. ,]+?)\\s*\\((?<acr>[A-Z0-9][A-Z0-9&\\.\\-]{1,9})\\)"
 pat_acr_exp <- "(?<acr>[A-Z0-9][A-Z0-9&\\.\\-]{1,9})\\s*\\((?<exp>[A-Za-z][A-Za-z0-9/&\\-\\. ,]+?)\\)"
 
-extract_pairs <- function(txt) {
-  # EXP (ACR)
+extract_pairs_one <- function(txt) {
   m1 <- str_match_all(txt, pat_exp_acr)[[1]]
   df1 <- if (nrow(m1)) tibble(acr = m1[, "acr"], exp = m1[, "exp"]) else tibble(acr=character(),exp=character())
-  # ACR (EXP)
   m2 <- str_match_all(txt, pat_acr_exp)[[1]]
   df2 <- if (nrow(m2)) tibble(acr = m2[, "acr"], exp = m2[, "exp"]) else tibble(acr=character(),exp=character())
   bind_rows(df1, df2)
 }
 
-
+# miner
 mine_acronym_pairs <- function(texts) {
-
-  cand <- map_dfr(texts, extract_pairs) %>%
+  cand <- map_dfr(texts, extract_pairs_one) %>%
     mutate(acr = toupper(str_squish(acr)),
            exp = str_squish(exp)) %>%
-    filter(nchar(acr) >= 2, nchar(exp) >= 3)
+    filter(nchar(acr) >= 2, nchar(exp) >= 3, !acr %in% catalog_markers)
 
   if (nrow(cand) == 0) return(cand)
 
-  cand <- cand %>%
-    filter(!acr %in% catalog_markers) %>%
-    rowwise() %>%
-    mutate(
-      valid_shape = looks_like_acronym(acr),
-      init_info   = list(initials_from_phrase(exp)),
-      init        = init_info$init,
-      n_tokens    = init_info$n_tokens
-    ) %>%
-    ungroup() %>%
-    select(-init_info)
+  iv <- initials_from_phrase_vec(cand$exp)
+  cand$init     <- iv$init
+  cand$n_tokens <- iv$n_tokens
 
-
-  hi_conf <- cand %>%
+  cand %>%
     filter(
-      valid_shape,
-      n_tokens >= nchar(acr),  # expansion must have at least as many tokens as letters
-      init == acr              # initials EXACTLY match acronym
+      looks_like_acronym(acr),
+      n_tokens >= nchar(acr),   # expansion must have ≥ letters in acronym
+      init == acr               # initials EXACT match
     ) %>%
     distinct(acr, exp)
-
-  hi_conf
 }
 
+# fuzzy collapse within ACR 
+collapse_within_acr_jw <- function(df, jw_thresh = JW_THRESH) {
+  if (!nrow(df)) return(df)
 
+  df <- df %>%
+    mutate(
+      exp  = strip_leading_connectors(as.character(exp)),
+      exp  = normalize_exp_display(exp),
+      freq = coalesce(as.integer(freq), 1L)
+    ) %>%
+    filter(!is.na(exp), nzchar(exp))
 
-hi_conf_pairs <- mine_acronym_pairs(texts)
-head(hi_conf_pairs, 20)
-
-
-
-normalize_exp <- function(x) {
-  x %>%
-    toupper() %>%
-    str_replace_all("[ ]*/[ ]*", " / ") %>%     # normalize slashes
-    str_replace_all("[ ]*-[ ]*", "-") %>%       # normalize hyphens
-    str_replace_all("\\s+", " ") %>%
-    str_squish()
-}
-
-dict_all <- hi_conf_pairs %>%
-  mutate(exp_norm = normalize_exp(exp)) %>%
-  count(acr, exp_norm, name = "freq", sort = TRUE) %>%
-  mutate(exp = exp_norm) %>%
-  select(acr, exp, freq)
-
-
-collapse_within_acr <- function(df, max_dist = 2) {
   if (nrow(df) <= 1) return(df)
-  keep <- rep(TRUE, nrow(df))
-  for (i in seq_len(nrow(df))) {
+
+  # exact duplicates first (prefer high freq, then longer exp)
+  df <- df %>%
+    arrange(desc(freq), desc(nchar(exp))) %>%
+    distinct(exp, .keep_all = TRUE)
+
+  n <- nrow(df); if (n <= 1) return(df)
+
+  # JW similarity matrix (0..1). Higher is more similar.
+  S <- 1 - stringdistmatrix(df$exp, df$exp, method = "jw")
+  diag(S) <- 1
+
+  keep <- rep(TRUE, n)
+  for (i in seq_len(n)) {
     if (!keep[i]) next
-    for (j in seq((i+1), nrow(df))) {
-      if (!keep[j]) next
-      if (stringdist::stringdist(df$exp[i], df$exp[j], method = "osa") <= max_dist) {
-        if (df$freq[j] > df$freq[i] ||
-            (df$freq[j] == df$freq[i] && nchar(df$exp[j]) > nchar(df$exp[i]))) {
-          df$exp[i]  <- df$exp[j]
-          df$freq[i] <- df$freq[j]
-        }
-        keep[j] <- FALSE
-      }
+    dup_idx <- which(S[i, ] >= jw_thresh & keep)
+    if (length(dup_idx)) {
+      grp <- c(i, dup_idx)
+      ord <- order(-df$freq[grp], -nchar(df$exp[grp]))
+      rep_idx <- grp[ord[1]]
+      drop_idx <- setdiff(grp, rep_idx)
+      keep[drop_idx] <- FALSE
     }
   }
   df[keep, , drop = FALSE]
 }
-dict_all <- dict_all %>%
+
+# ----------------------- RUN PIPELINE ----------------------------------
+
+hi_conf_pairs <- mine_acronym_pairs(texts)
+
+# 2) Build long dictionary with frequencies
+dict_all_raw <- hi_conf_pairs %>%
+  mutate(exp = normalize_exp_display(exp)) %>%
+  count(acr, exp, name = "freq", sort = TRUE)
+
+# 3) Collapse near-duplicate expansions within each acronym (JW)
+dict_all <- dict_all_raw %>%
   group_by(acr) %>%
-  group_modify(~ collapse_within_acr(.x)) %>%
+  group_modify(~ collapse_within_acr_jw(.x, jw_thresh = JW_THRESH)) %>%
   ungroup()
 
-
+# 4) Primary expansion per acronym (highest freq; tie → longest)
 dict_primary <- dict_all %>%
   group_by(acr) %>%
   arrange(desc(freq), desc(nchar(exp))) %>%
@@ -215,29 +243,124 @@ dict_primary <- dict_all %>%
   select(acr, exp)
 
 
-dict_all %>% filter(acr %in% c("EHM","TIS"))
-dict_primary %>% filter(acr %in% c("EHM","TIS"))
-
-# write.csv(dict_all, "Data/acronyms_mined_all.csv", row.names = FALSE)
-# write.csv(dict_primary, "Data/acronyms_mined_primary.csv", row.names = FALSE)
-
 
 ```
 
 Merge
 ```{r}
 
-dict_merged <- bind_rows(
-  dict %>% mutate(source = "DAU"),
-  dict %>% 
-    filter(!acr %in% acr_dict_dau$acr) %>% 
-    mutate(source = "mined")
-)
 
-dict_all_merged <- bind_rows(
-  acr_dict_dau %>% mutate(source = "DAU", freq = NA),
-  dict_all %>% filter(!acr %in% acr_dict_dau$acr) %>% mutate(source = "mined")
-)
+ACRONYM_KEEP <- c("DoD","USAF","USN","USMC","USA","AFOTEC","JSF","COTS",
+                  "F-35","MTBF","BOM","SDRL","NSN","CLIN","NIIN","CAGE",
+                  "ISR","GPS","RF","IT","AI","UAS","UAV","SATCOM")
+
+SMALL_WORDS <- c("and","or","of","the","for","in","on","with","to","by",
+                 "at","from","a","an")
+
+normalize_spaces <- function(x) {
+  x %>% str_replace_all("\\s+", " ") %>% str_squish()
+}
+
+title_token <- function(tok) {
+  if (tok %in% ACRONYM_KEEP) return(tok)
+  if (grepl("^[A-Z0-9\\-\\/]+$", tok) && str_detect(tok, "[A-Z]{2,}")) return(tok)
+  split_and_cap <- function(s, sep) {
+    parts <- strsplit(s, sep, fixed = TRUE)[[1]]
+    parts <- ifelse(nchar(parts),
+                    paste0(str_to_upper(substr(parts,1,1)),
+                           str_to_lower(substr(parts,2,nchar(parts)))),
+                    parts)
+    paste(parts, collapse = sep)
+  }
+  tok <- split_and_cap(tok, "-")
+  tok <- split_and_cap(tok, "/")
+  tok
+}
+
+pretty_case <- function(x) {
+  if (is.na(x) || !nzchar(x)) return(x)
+  x0 <- normalize_spaces(x)
+  toks <- strsplit(x0, " +")[[1]]
+  if (!length(toks)) return(x0)
+
+  base <- vapply(toks, identity, FUN.VALUE = character(1), USE.NAMES = FALSE)
+  out <- character(length(base))
+
+  for (i in seq_along(base)) {
+    b <- base[i]
+    if (tolower(b) %in% SMALL_WORDS && i != 1 && i != length(base)) {
+      out[i] <- tolower(b)
+    } else {
+      out[i] <- title_token(b)
+    }
+  }
+
+  out <- ifelse(toupper(out) %in% toupper(ACRONYM_KEEP),
+                ACRONYM_KEEP[match(toupper(out), toupper(ACRONYM_KEEP))],
+                out)
+
+  paste(out, collapse = " ")
+}
+
+pretty_case_vec <- function(x) vapply(x, pretty_case, character(1))
+
+# -------------------------------------------------------------------
+# Build mined dictionaries
+
+# dict all and dict_primary are mined. acr_dict_dau is the DAU dict
+acr_mined_all <- dict_all %>%
+  mutate(
+    exp_uc      = toupper(exp),
+    exp_display = pretty_case_vec(exp)
+  )
+
+acr_mined_primary <- dict_primary %>%
+  mutate(
+    exp_uc      = toupper(exp),
+    exp_display = pretty_case_vec(exp)
+  )
+
+if (exists("acr_dict_dau")) {
+  acr_dau_clean <- acr_dict_dau %>%
+    mutate(
+      acr        = toupper(str_squish(acr)),
+      exp        = normalize_spaces(exp),
+      exp_uc     = toupper(exp),
+      exp_display= pretty_case_vec(exp)
+    ) %>%
+    filter(nzchar(acr), nzchar(exp)) %>%
+    distinct(acr, exp_uc, .keep_all = TRUE) %>%
+    group_by(acr) %>%
+    slice_max(order_by = nchar(exp_display), n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(acr, exp_uc, exp_display)
+
+
+
+# merge, mined had priority
+  
+  acr_final_primary <- bind_rows(
+    acr_mined_primary %>% transmute(acr, exp_uc, exp_display, source = "mined"),
+    acr_dau_clean %>%
+      filter(!acr %in% acr_mined_primary$acr) %>%
+      transmute(acr, exp_uc, exp_display, source = "DAU")
+  ) %>%
+    distinct(acr, .keep_all = TRUE)
+
+  acr_final_all <- bind_rows(
+    acr_mined_all %>% transmute(acr, exp_uc, exp_display, freq, source = "mined"),
+    acr_dau_clean %>% mutate(freq = NA_integer_, source = "DAU")
+  ) %>%
+    distinct(acr, exp_uc, .keep_all = TRUE)
+
+} else {
+  acr_final_primary <- acr_mined_primary %>%
+    transmute(acr, exp_uc, exp_display, source = "mined")
+
+  acr_final_all <- acr_mined_all %>%
+    transmute(acr, exp_uc, exp_display, freq, source = "mined")
+}
+
 
 
 ```
