@@ -1,0 +1,50 @@
+---
+title: "LDA_subcontracts"
+output: html_document
+date: "2025-08-28"
+---
+
+```{r setup, include=FALSE}
+# install.packages("quanteda")
+# install.packages("topicmodels")
+# install.packages("quanteda.textplots")
+# install.packages("dplyr")
+
+library(quanteda)
+library(topicmodels)
+library(quanteda.textplots)
+library(dplyr)
+
+k <- 4
+
+if (!exists("subcontract")) subcontract <- readRDS("/mnt/data/subcontract.RDS")
+
+x <- subcontract$subaward_description %>% 
+   as.character()
+
+corp <- corpus(x, docnames = as.character(seq_along(x)))
+toks <- tokens(corp, remove_punct = TRUE, remove_numbers = TRUE, remove_symbols = TRUE) |>
+  tokens_tolower() |>
+  tokens_remove(stopwords("en"))
+dfm_all <- dfm(toks) |>
+  dfm_trim(min_termfreq = 5, min_docfreq = 5)
+
+dfm_kept <- dfm_subset(dfm_all, ntoken(dfm_all) > 0)
+
+dtm <- convert(dfm_kept, to = "topicmodels")
+lda_fit <- LDA(dtm, k = k, control = list(seed = 123))
+
+topics_lda <- topics(lda_fit)
+topics_full <- rep(NA_integer_, length(x))
+topics_full[as.integer(docnames(dfm_kept))] <- as.integer(topics_lda)
+subcontract$topic <- topics_full
+
+beta <- posterior(lda_fit)$terms
+topic_dfm <- quanteda::as.dfm(beta)
+docnames(topic_dfm) <- paste0("Topic_", seq_len(ndoc(topic_dfm)))
+
+textplot_wordcloud(topic_dfm, comparison = TRUE, max_words = 200)
+
+```
+
+```{r}
