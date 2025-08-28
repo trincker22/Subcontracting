@@ -5,26 +5,9 @@ date: "2025-08-15"
 ---
 
 
-To do: 
-
-READABLE
-First, sort out subaward descriptions that do not need further processing 
-Then, make a dictionary for abbreviations. Look for DoD specific, or use method to find definitions within corpus. 
-Can also make a list to identify problem ones to search up if it is relatively short. 
-Third, use NLP on remaining unreadable subaward description. 
-
-LDA- write a quick LDA + textplot to visualize unsupervised groupings. 
-
-CATEGORIZATION PROBLEM
-There are 183 categories that the 400k distinct subaward descriptions may fall into. Handcode, then run a categorization model.
-
 ```{r}
+
 rm(list = ls())
-
-
-```
-
-```{r setup, include=FALSE}
 
 library(tidyverse)
 library(haven)
@@ -34,7 +17,7 @@ library(jsonlite)
 library(janitor)
 library(purrr)
 library(lubridate)
-library(quanteda)  
+library(quanteda)
 library(quanteda.textmodels)
 library(here)
 library(tokenizers)
@@ -58,30 +41,9 @@ library(scales)
 options(scipen = 999)
 
 
-# full set of obs to run data exploration. sliced so the observation level is primary contract. 
-# Data exploration primary df name is "sub" 
-# sub <- read_dta("M:/Xiaoqing/Subcontracting/forNLP.dta")
-
-# sub <- sub %>%
-#   group_by(prime_id) %>%
-#   slice_head(n=1) %>%
-#   ungroup()
-# sub <- sub %>%
-#   mutate(year = year(date(prime_date)))
-
-
-
-# Deduped, this is for text processing on the sub description 
-# the primary df name for text processing is "subcontract"
-# subcontract <- read_rds(here("subcontracts.RDS"))
-
 ```
 
-Get standardized 2022 NAICS code
-
-
 ```{r}
-
 
 rev_for_year <- function(y) dplyr::case_when(y <= 2011 ~ 2007L,
                                              y <= 2016 ~ 2012L,
@@ -159,61 +121,6 @@ build_naics_prior_2022 <- function(df_std, psc_col = "product_or_service_code_de
     ungroup()
 }
 
-cw_07_12 <- read_xls(here("Data","NAICSCrosswalks","2012_to_2007_NAICS.xls"))
-cw_12_17 <- read_xlsx(here("Data","NAICSCrosswalks","2012_to_2017_NAICS.xlsx"))
-cw_17_22 <- read_xlsx(here("Data","NAICSCrosswalks","2022_to_2017_NAICS.xlsx"))
-
-cw_07_12_p <- prep_crosswalk(cw_07_12, from_col = "2007 NAICS Code", to_col = "2012 NAICS Code")
-cw_12_17_p <- prep_crosswalk(cw_12_17, from_col = "2012 NAICS Code", to_col = "2017 NAICS Code")
-cw_17_22_p <- prep_crosswalk(cw_17_22, from_col = "2017 NAICS Code", to_col = "2022 NAICS Code")
-
-std <- standardize_naics_to_2022(sub,
-                                 naics_col = "naics_code",
-                                 year_col  = "year",
-                                 cw_07_12_p = cw_07_12_p,
-                                 cw_12_17_p = cw_12_17_p,
-                                 cw_17_22_p = cw_17_22_p)
-
-std <- normalize_weights(std)
-
-
-
-std_one <- collapse_to_single_naics(std)
-naics_prior_2022 <- build_naics_prior_2022(std, psc_col = "product_or_service_code_descript",
-                                           naics_col = "naics_2022", weight_col = "weight")
-
-
-# ---------------------------------------------------------------
-# checking 
-
-std %>% 
-  dplyr::count(year, map_path) %>% 
-  arrange(year, map_path)
-
-
-orig_codes <- sub %>%
- mutate(.row_id = row_number(),
-                code_orig = stringr::str_pad(as.character(naics_code), 6, "left", "0")) %>%
- select(.row_id, code_orig)
-
-audit <- std %>%
-  left_join(orig_codes, by = ".row_id") %>%
-  mutate(changed = code_orig != naics_2022)
-
-
-audit %>% dplyr::count(changed)
-
-audit %>%
-  filter(changed) %>%
-  distinct(year, map_path, code_orig, naics_2022) %>%
-  arrange(year) %>%
-  slice_head(n = 15)
-
-
-#-----------------------------------------------------------------------------
-# Add Metadata For 2022 NAICS 
-
-
 prep_naics2022_key_from_clean <- function(df_clean) {
   df_clean %>%
     clean_names() %>%
@@ -242,17 +149,6 @@ attach_naics_titles_2022 <- function(df, code_col = "naics_2022", key_df, levels
   }
   out %>% select(-`._code6`)
 }
-
-# usage
-key_path <- here("Data","NAICSCrosswalks","2022_codes.xlsx")
-codes2022 <- read_xlsx(key_path) %>% clean_names()
-codes22_key <- prep_naics2022_key_from_clean(codes2022)
-std_one <- attach_naics_titles_2022(sub, code_col = "naics_2022", key_df = codes22_key, levels = c(6,3,2))
-
-```
-
-
-```{r}
 
 normalize_psc_code <- function(x) {
   x <- as.character(x)
@@ -299,28 +195,152 @@ dedupe_psc_title_to_code <- function(PSC,
 
 norm_title <- function(x) str_squish(str_to_upper(as.character(x)))
 
-
-psc_path <- "~/Downloads/PSC April 2025.xlsx"
-PSC <- read_psc_2025(psc_path)
-
-
-psc_map <- dedupe_psc_title_to_code(PSC) %>%
-  mutate(psc_title = norm_title(psc_title)) %>%
-  distinct(psc_title, .keep_all = TRUE)
-
-
-sub_with_psc_code <- subcontract %>%
-  mutate(psc_title = norm_title(product_or_service_code_descript)) %>%
-  left_join(psc_map, by = "psc_title") %>%
-  select(-psc_title)
-
+theme_clean <- theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 10),
+        legend.text  = element_text(size = 9),
+        axis.text.x  = element_text(angle = 45, hjust = 1))
+scale_color_wrapped <- scale_color_discrete(labels = ~ stringr::str_wrap(.x, 28))
+scale_fill_wrapped  <- scale_fill_discrete(labels  = ~ stringr::str_wrap(.x, 28))
 
 
 ```
 
 ```{r}
 
+if (exists("subcontract") && !exists("subcontracts")) {
+  subcontracts <- subcontract
+}
+stopifnot(exists("subcontracts"))
 
+if ("prime_id" %in% names(subcontracts)) {
+  sub <- subcontracts %>%
+    group_by(prime_id) %>%
+    slice_head(n = 1) %>%
+    ungroup()
+} else if ("prime_id_num" %in% names(subcontracts)) {
+  sub <- subcontracts %>%
+    group_by(prime_id_num) %>%
+    slice_head(n = 1) %>%
+    ungroup()
+} else {
+  sub <- subcontracts %>% distinct(.keep_all = TRUE)
+}
+
+key_candidate <- intersect(c("prime_id_num","prime_id"), names(subcontracts))
+stopifnot(length(key_candidate) >= 1)
+best_key <- key_candidate[1]
+
+subcontracts <- subcontracts %>% mutate(obs_id = as.character(.data[[best_key]]))
+sub <- sub %>% mutate(obs_id = as.character(.data[[best_key]]))
+
+coerce_date <- function(x) suppressWarnings(as.Date(x))
+if ("prime_date" %in% names(subcontracts)) {
+  subcontracts <- subcontracts %>% mutate(prime_date = coerce_date(prime_date),
+                                          year = lubridate::year(prime_date))
+}
+if ("prime_date" %in% names(sub)) {
+  sub <- sub %>% mutate(prime_date = coerce_date(prime_date),
+                        year = lubridate::year(prime_date))
+}
+
+if (!"nom_g" %in% names(subcontracts)) {
+  valcand <- intersect(c("obligated_amount","action_obligation","amount","value"), names(subcontracts))
+  if (length(valcand) == 1) {
+    subcontracts <- subcontracts %>% rename(nom_g = !!valcand)
+  }
+}
+if (!"nom_g" %in% names(sub) && "nom_g" %in% names(subcontracts)) {
+  keep_cols <- intersect(c("obs_id","nom_g"), names(subcontracts))
+  sub <- sub %>% select(-any_of("nom_g")) %>% left_join(subcontracts %>% select(any_of(keep_cols)), by="obs_id")
+}
+
+if (!"product_or_service_code_descript" %in% names(subcontracts)) {
+  alt_psc <- intersect(c("product_or_service_code_description","psc_description","psc_title"), names(subcontracts))
+  if (length(alt_psc) == 1) {
+    subcontracts <- subcontracts %>%
+      rename(product_or_service_code_descript = !!alt_psc)
+  }
+}
+
+if (!"naics_code" %in% names(sub)) {
+  if ("naics_code" %in% names(subcontracts)) {
+    sub <- sub %>% select(-any_of("naics_code")) %>%
+      left_join(subcontracts %>% select(obs_id, naics_code), by = "obs_id")
+  }
+}
+if (!"year" %in% names(sub) && "year" %in% names(subcontracts)) {
+  sub <- sub %>% left_join(subcontracts %>% select(obs_id, year), by = "obs_id")
+}
+
+
+```
+
+```{r}
+
+cw_07_12 <- read_xls(here("Data","NAICSCrosswalks","2012_to_2007_NAICS.xls"))
+cw_12_17 <- read_xlsx(here("Data","NAICSCrosswalks","2012_to_2017_NAICS.xlsx"))
+cw_17_22 <- read_xlsx(here("Data","NAICSCrosswalks","2022_to_2017_NAICS.xlsx"))
+
+cw_07_12_p <- prep_crosswalk(cw_07_12, from_col = "2007 NAICS Code", to_col = "2012 NAICS Code")
+cw_12_17_p <- prep_crosswalk(cw_12_17, from_col = "2012 NAICS Code", to_col = "2017 NAICS Code")
+cw_17_22_p <- prep_crosswalk(cw_17_22, from_col = "2017 NAICS Code", to_col = "2022 NAICS Code")
+
+std <- standardize_naics_to_2022(sub,
+                                 naics_col = "naics_code",
+                                 year_col  = "year",
+                                 cw_07_12_p = cw_07_12_p,
+                                 cw_12_17_p = cw_12_17_p,
+                                 cw_17_22_p = cw_17_22_p)
+
+std <- normalize_weights(std)
+std_one <- collapse_to_single_naics(std)
+
+key_path <- here("Data","NAICSCrosswalks","2022_codes.xlsx")
+codes2022 <- read_xlsx(key_path) %>% clean_names()
+codes22_key <- prep_naics2022_key_from_clean(codes2022)
+std_one <- attach_naics_titles_2022(std_one, code_col = "naics_2022", key_df = codes22_key, levels = c(6,3,2))
+
+naics_prior_2022 <- build_naics_prior_2022(std, psc_col = "product_or_service_code_descript",
+                                           naics_col = "naics_2022", weight_col = "weight")
+
+std %>% dplyr::count(year, map_path) %>% arrange(year, map_path)
+
+orig_codes <- sub %>%
+  mutate(.row_id = row_number(),
+         code_orig = stringr::str_pad(as.character(naics_code), 6, "left", "0")) %>%
+  select(.row_id, code_orig)
+
+audit <- std %>%
+  left_join(orig_codes, by = ".row_id") %>%
+  mutate(changed = code_orig != naics_2022)
+
+audit %>% dplyr::count(changed)
+
+audit %>%
+  filter(changed) %>%
+  distinct(year, map_path, code_orig, naics_2022) %>%
+  arrange(year) %>%
+  slice_head(n = 15)
+
+psc_path <- "~/Downloads/PSC April 2025.xlsx"
+PSC <- read_psc_2025(psc_path)
+
+psc_map <- dedupe_psc_title_to_code(PSC) %>%
+  mutate(psc_title = norm_title(psc_title)) %>%
+  distinct(psc_title, .keep_all = TRUE)
+
+subcontracts <- subcontracts %>%
+  mutate(psc_title = norm_title(product_or_service_code_descript)) %>%
+  left_join(psc_map, by = "psc_title") %>%
+  select(-psc_title)
+
+
+```
+
+```{r}
+
+naics_key6 <- std_one %>% distinct(naics_2022, naics6_title)
 
 summary_data_all <- std_one %>%
   group_by(year, naics_2022) %>%
@@ -328,8 +348,11 @@ summary_data_all <- std_one %>%
     num_contracts = n(),
     avg_contract_value = mean(nom_g, na.rm = TRUE),
     total_contract_value = sum(nom_g, na.rm = TRUE),
-    .groups = "drop") %>% 
-  left_join(std_one %>% select(naics_2022, naics6_title), join_by(naics_2022))
+    .groups = "drop"
+  ) %>%
+  left_join(naics_key6, by = "naics_2022", relationship = "many-to-one")
+
+
 
 top_5_naics_value <- summary_data_all %>%
   group_by(naics6_title) %>%
@@ -372,20 +395,8 @@ overall <- sub %>%
     yoy_val = 100 * (total_value   / lag(total_value)   - 1)
   )
 
-wrap_legend <- function(x, width = 28) stringr::str_wrap(x, width = width)
-legend_guide_bottom <- guides(color = guide_legend(nrow = 2, byrow = TRUE),
-                              fill  = guide_legend(nrow = 2, byrow = TRUE))
-theme_clean <- theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom",
-        legend.title = element_text(size = 10),
-        legend.text  = element_text(size = 9),
-        axis.text.x  = element_text(angle = 45, hjust = 1))
-scale_color_wrapped <- scale_color_discrete(labels = ~ wrap_legend(.x, 28))
-scale_fill_wrapped  <- scale_fill_discrete(labels  = ~ wrap_legend(.x, 28))
 
 ```
-
-##Data Visualization
 
 ```{r}
 
@@ -413,7 +424,7 @@ overall %>%
 ```{r}
 
 overall %>%
-  filter(!is.na(yoy_num), year >2011, year <2024) %>%
+  filter(!is.na(yoy_num), year > 2011, year < 2024) %>%
   ggplot(aes(x = year, y = yoy_num)) +
   geom_line() + geom_point() +
   scale_y_continuous(labels = label_percent(scale = 0.01)) +
@@ -421,18 +432,20 @@ overall %>%
   labs(title = "YoY Change: Number of Contracts", x = "Year", y = "YoY %") +
   theme_clean
 
+
 ```
 
 ```{r}
 
 overall %>%
-  filter(!is.na(yoy_val), year >2011, year <2024) %>%
+  filter(!is.na(yoy_val), year > 2011, year < 2024) %>%
   ggplot(aes(x = year, y = yoy_val)) +
   geom_line() + geom_point() +
   scale_y_continuous(labels = label_percent(scale = 0.01)) +
   scale_x_continuous(breaks = sort(unique(overall$year))) +
   labs(title = "YoY Change: Total Contract Value", x = "Year", y = "YoY %") +
   theme_clean
+
 
 ```
 
@@ -446,7 +459,10 @@ yoy_change_data %>%
   scale_x_continuous(breaks = sort(unique(yoy_change_data$year))) +
   labs(title = "YoY % Change in Number of Contracts, Top 5 NAICS",
        x = "Year", y = "YoY %", color = "NAICS Industry Title") +
-  scale_color_wrapped + theme_clean + legend_guide_bottom
+  scale_color_wrapped + theme_clean + guides(color = guide_legend(nrow = 2, byrow = TRUE),
+                                             fill  = guide_legend(nrow = 2, byrow = TRUE))
+
+
 
 ```
 
@@ -460,7 +476,8 @@ yoy_change_data %>%
   scale_x_continuous(breaks = sort(unique(yoy_change_data$year))) +
   labs(title = "YoY % Change in Total Contract Value, Top 5 NAICS",
        x = "Year", y = "YoY %", color = "NAICS Industry Title") +
-  scale_color_wrapped + theme_clean + legend_guide_bottom
+  scale_color_wrapped + theme_clean + guides(color = guide_legend(nrow = 2, byrow = TRUE),
+                                             fill  = guide_legend(nrow = 2, byrow = TRUE))
 
 
 ```
@@ -473,7 +490,8 @@ ggplot(filtered_summary_top5_value,
   scale_x_continuous(breaks = sort(unique(filtered_summary_top5_value$year))) +
   labs(title = "Number of Contracts Over Time, Top 5 NAICS",
        x = "Year", y = "Number of Contracts", color = "NAICS Industry Title") +
-  scale_color_wrapped + theme_clean + legend_guide_bottom
+  scale_color_wrapped + theme_clean + guides(color = guide_legend(nrow = 2, byrow = TRUE),
+                                             fill  = guide_legend(nrow = 2, byrow = TRUE))
 
 
 ```
@@ -487,7 +505,8 @@ ggplot(filtered_summary_top5_value,
   scale_x_continuous(breaks = sort(unique(filtered_summary_top5_value$year))) +
   labs(title = "Average Contract Value Over Time Top 5 NAICS",
        x = "Year", y = "Average Contract Value", color = "NAICS Industry Title") +
-  scale_color_wrapped + theme_clean + legend_guide_bottom
+  scale_color_wrapped + theme_clean + guides(color = guide_legend(nrow = 2, byrow = TRUE),
+                                             fill  = guide_legend(nrow = 2, byrow = TRUE))
 
 
 ```
@@ -500,7 +519,9 @@ ggplot(grouped_data_for_shares,
   scale_y_continuous(labels = percent) +
   labs(title = "Share of Contract Count by Year (Top 5 vs Other)",
        x = "Year", y = "Share", fill = "NAICS Group") +
-  scale_fill_wrapped + theme_clean + legend_guide_bottom
+  scale_fill_wrapped + theme_clean + guides(color = guide_legend(nrow = 2, byrow = TRUE),
+                                            fill  = guide_legend(nrow = 2, byrow = TRUE))
+
 
 ```
 
@@ -512,21 +533,17 @@ ggplot(grouped_data_for_shares,
   scale_y_continuous(labels = percent) +
   labs(title = "Share of Contract Value by Year (Top 5 vs Other)",
        x = "Year", y = "Share", fill = "NAICS Group") +
-  scale_fill_wrapped + theme_clean + legend_guide_bottom
+  scale_fill_wrapped + theme_clean + guides(color = guide_legend(nrow = 2, byrow = TRUE),
+                                            fill  = guide_legend(nrow = 2, byrow = TRUE))
+
 
 ```
 
 ```{r}
 
-theme_clean <- theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom",
-        legend.title = element_text(size = 10),
-        legend.text  = element_text(size = 9),
-        axis.text.x  = element_text(angle = 45, hjust = 1))
-
 sub_prep <- std_one %>%
   mutate(prime_date = as.Date(prime_date),
-         year = year(prime_date)) 
+         year = year(prime_date))
 
 summary_data_all <- sub_prep %>%
   group_by(year, naics6_title) %>%
@@ -548,28 +565,32 @@ ggplot(hhi_by_year, aes(x = year, y = HHI)) +
        x = "Year", y = "HHI (0–10,000)") +
   theme_clean
 
+
 ```
 
 The HHI (Herfindahl-Hirschman Index) measures market concentration. HHI is the sum of each industry's % share\*100, squared, for each year. If all the shares are small, nearing perfect competition, then the HHI will be close to 0 because the squared shares are very small. If one firm has 100% share, 100\^2 will be 10,000, the max HHI value. Below 1,500 is considered not concentrated, while an HHI above 2500 is considered highly concentrated. We can see here that concentration has decreased since 2010, but largely has not been concentrated. This value only measures the concentration of industries within federal government contracts, it does not say anything about the firm composition within any given industry.
 
+
 ```{r}
 
-monthly_series <- sub_prep %>%
-  mutate(month = floor_date(prime_date, "quarter")) %>%
-  group_by(month) %>%
+quarterly_series <- sub_prep %>%
+  mutate(quarter = floor_date(prime_date, "quarter")) %>%
+  group_by(quarter) %>%
   summarise(total_value = sum(nom_g, na.rm = TRUE), .groups = "drop")
 
-ggplot(monthly_series, aes(x = month, y = total_value)) +
+ggplot(quarterly_series, aes(x = quarter, y = total_value)) +
   geom_line() +
-  geom_point()+
+  geom_point() +
   scale_y_continuous(labels = label_number(scale_cut = cut_short_scale())) +
   labs(title = "Quarterly Total Contract Value Over Time",
        x = "Quarter", y = "Total Contract Value") +
   theme_clean
 
+
 ```
 
 ```{r}
+
 size_vs_count <- summary_data_all %>%
   group_by(naics6_title) %>%
   summarise(total_value = sum(total_contract_value, na.rm = TRUE),
@@ -583,6 +604,7 @@ ggplot(size_vs_count, aes(x = num_contracts, y = total_value)) +
   labs(title = "Contracts: Count vs Total Value by NAICS (All Years)",
        x = "Number of Contracts", y = "Total Contract Value") +
   theme_clean
+
 
 ```
 
@@ -606,21 +628,22 @@ The codes/acronyms issue can probably be solved without an LLM. There are dictio
 
 So for ex., if you were categorizing news, then the words "football" and "player" would have large coefficients for the sports category. This is frequence based.
 
+
+
 ```{r}
 
 chat <- ellmer::chat_google_gemini()
 
 contracts <- subcontracts %>%
   mutate(
-    obs_id        = as.character(prime_id_num),
+    obs_id        = as.character(obs_id),
     broad_cat     = product_or_service_code_descript,
     specific_desc = subaward_description,
-    naics         = naics_title
+    naics         = coalesce(naics_title, as.character(naics_code))
   ) %>%
   select(obs_id, broad_cat, specific_desc, naics) %>%
   distinct(obs_id, .keep_all = TRUE)
 
-# prompts
 prompt_readable <- function(broad, specific) {
   glue(
     "{{\n  \"task\": \"rewrite_to_plain_english\",\n  \"schema\": {{\n    \"returned_text\": \"string\",\n    \"notes\": \"string\"\n  }},\n  \"instructions\": \"You are given a general contract category and a specific subaward description. If the description is already human-readable, return it unchanged. If it is code-like or obscure, return a brief plain-English description. Be conservative: no hallucinated details; if in doubt, summarize functionally.\",\n  \"category\": \"{broad}\",\n  \"description\": \"{specific}\",\n  \"output_format\": \"JSON with fields returned_text, notes\"\n}}"
@@ -633,12 +656,6 @@ prompt_relation <- function(broad, specific) {
   )
 }
 
-
-#-------------------------------------------------
-# Builder Functions
-#-------------------------------------------------
-
-# LLM Caller with exponential sys sleep 
 call_chat_safe <- function(prompt, max_tries = 5, base_sleep = 2) {
   for (i in seq_len(max_tries)) {
     txt <- try({
@@ -652,10 +669,8 @@ call_chat_safe <- function(prompt, max_tries = 5, base_sleep = 2) {
   NA_character_
 }
 
-# JSON Parser
 parse_json_relaxed <- function(txt) {
   if (is.na(txt)) return(tibble(parsed_ok = FALSE))
-
   m1 <- stringr::str_match(txt, "(?s)```(?:json)?\\s*(\\{[\\s\\S]*?\\})\\s*```")
   if (!is.na(m1[, 2])) {
     json_txt <- m1[, 2]
@@ -663,70 +678,53 @@ parse_json_relaxed <- function(txt) {
     m2 <- stringr::str_match_all(txt, "\\{[\\s\\S]*?\\}")
     if (length(m2) && nrow(m2[[1]]) > 0) json_txt <- tail(m2[[1]][, 1], 1) else json_txt <- txt
   }
-
   out <- try(jsonlite::fromJSON(json_txt), silent = TRUE)
   if (inherits(out, "try-error")) tibble(parsed_ok = FALSE)
   else dplyr::bind_cols(tibble(parsed_ok = TRUE), tibble::as_tibble(out))
 }
 
-# NA if cols missing
 ensure_cols <- function(df, cols) {
   missing <- setdiff(cols, names(df))
   for (nm in missing) df[[nm]] <- NA_character_
   df
 }
 
-#  Batch runner
 run_llm_over_df <- function(df, broad_col, specific_col,
                             which_prompt = c("readable", "relation"),
                             batch_size = 20,
                             checkpoint_path = NULL,
-                            temperature = 0.0, # max determinism parameter in LLM
+                            temperature = 0.0,
                             verbose = TRUE) {
   which_prompt <- match.arg(which_prompt)
   df <- df %>% mutate(obs_id = as.character(.data[["obs_id"]]))
   n <- nrow(df)
   if (n == 0) return(tibble())
-
   idx <- split(seq_len(n), ceiling(seq_along(seq_len(n)) / batch_size))
   results <- vector("list", length(idx))
-
   for (bi in seq_along(idx)) {
     rows <- df[idx[[bi]], , drop = FALSE]
-
     rows_small <- tibble::tibble(
       obs_id = rows$obs_id,
       broad  = rows[[broad_col]],
       spec   = rows[[specific_col]]
     )
-
     prompts <- purrr::pmap(rows_small, function(obs_id, broad, spec) {
       if (which_prompt == "readable") prompt_readable(broad, spec) else prompt_relation(broad, spec)
     })
-
     raw    <- purrr::map(prompts, ~ call_chat_safe(.x))
     parsed <- purrr::map_dfr(raw, parse_json_relaxed)
-
     out <- tibble::tibble(
       obs_id = rows$obs_id,
       raw    = unlist(raw, use.names = FALSE)
     ) %>% dplyr::bind_cols(parsed)
-
     results[[bi]] <- out
-
     if (!is.null(checkpoint_path)) {
       readr::write_rds(dplyr::bind_rows(results[seq_len(bi)]), checkpoint_path)
       if (verbose) message(glue("[{bi}/{length(idx)}] wrote checkpoint: {checkpoint_path} (rows so far: {nrow(dplyr::bind_rows(results[seq_len(bi)]))})"))
     }
   }
-
   dplyr::bind_rows(results)
 }
-
-
-#-------------------------------------------------
-# Initializing Checkpoint Files
-#-------------------------------------------------
 
 readable_ckpt <- here("Checkpoints/readable_checkpoint.rds")
 relation_ckpt <- here("Checkpoints/relation_checkpoint.rds")
@@ -757,16 +755,8 @@ if (!file.exists(relation_ckpt)) {
   )
 }
 
-prev_readable <- read_rds(readable_ckpt)
-prev_rel      <- read_rds(relation_ckpt)
-
 prev_readable <- if (file.exists(readable_ckpt)) readr::read_rds(readable_ckpt) else tibble(obs_id = character())
 prev_rel      <- if (file.exists(relation_ckpt)) readr::read_rds(relation_ckpt) else tibble(obs_id = character())
-
-
-#-------------------------------------------------
-# Run Readable, then Relation
-#-------------------------------------------------
 
 needs_readable <- dplyr::anti_join(
   contracts %>% dplyr::select(obs_id, broad_cat, specific_desc),
@@ -801,7 +791,6 @@ contracts <- contracts %>%
     by = "obs_id"
   )
 
-# ---- RELATION
 needs_rel <- dplyr::anti_join(
   contracts %>% dplyr::select(obs_id, broad_cat, specific_desc),
   prev_rel %>% dplyr::select(obs_id),
@@ -836,9 +825,7 @@ contracts <- contracts %>%
   )
 
 
-```
 
-```{r}
 
 
 ```
