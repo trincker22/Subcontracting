@@ -254,10 +254,73 @@ std_one <- attach_naics_titles_2022(sub, code_col = "naics_2022", key_df = codes
 
 ```{r}
 
+normalize_psc_code <- function(x) {
+  x <- as.character(x)
+  x <- str_squish(x)
+  x <- str_replace(x, "^(\\d+)\\.0+$", "\\1")
+  x
+}
+
+read_psc_2025 <- function(path, sheet = 1) {
+  hdr <- read_xlsx(path, sheet = sheet, n_max = 0)
+  ct  <- rep("guess", length(hdr)); ct[1] <- "text"
+  read_xlsx(path, sheet = sheet, col_types = ct, .name_repair = "minimal") %>%
+    clean_names() %>%
+    mutate(
+      psc_code = normalize_psc_code(psc_code),
+      product_and_service_code_name = str_squish(as.character(product_and_service_code_name)),
+      start_date = suppressWarnings(mdy(as.character(start_date))),
+      end_date   = suppressWarnings(mdy(as.character(end_date)))
+    )
+}
+
+dedupe_psc_title_to_code <- function(PSC,
+                                     code_col  = "psc_code",
+                                     title_col = "product_and_service_code_name",
+                                     start_col = "start_date",
+                                     end_col   = "end_date") {
+  PSC %>%
+    mutate(
+      code   = normalize_psc_code(.data[[code_col]]),
+      title  = as.character(.data[[title_col]]),
+      start  = suppressWarnings(mdy(.data[[start_col]])),
+      end    = suppressWarnings(mdy(.data[[end_col]])),
+      title_norm = str_squish(title),
+      code_len   = nchar(gsub("[^A-Za-z0-9]", "", code)),
+      active     = ifelse(is.na(end), 1L, 0L)
+    ) %>%
+    distinct(code, title_norm, .keep_all = TRUE) %>%
+    group_by(title_norm) %>%
+    arrange(desc(code_len), desc(active), desc(start), code, .by_group = TRUE) %>%
+    slice(1) %>%
+    ungroup() %>%
+    transmute(psc_title = title_norm, psc_code = code)
+}
+
+norm_title <- function(x) str_squish(str_to_upper(as.character(x)))
+
+
+psc_path <- "~/Downloads/PSC April 2025.xlsx"
+PSC <- read_psc_2025(psc_path)
+
+
+psc_map <- dedupe_psc_title_to_code(PSC) %>%
+  mutate(psc_title = norm_title(psc_title)) %>%
+  distinct(psc_title, .keep_all = TRUE)
+
+
+sub_with_psc_code <- subcontract %>%
+  mutate(psc_title = norm_title(product_or_service_code_descript)) %>%
+  left_join(psc_map, by = "psc_title") %>%
+  select(-psc_title)
+
+
+
 ```
 
-
 ```{r}
+
+
 
 summary_data_all <- std_one %>%
   group_by(year, naics_2022) %>%
