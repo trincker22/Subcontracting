@@ -77,6 +77,47 @@ options(scipen = 999)
 
 ```
 
+PSC code helpers
+
+```{r psc_setup}
+normalize_psc_code <- function(x) {
+  x <- as.character(x)
+  x <- str_squish(x)
+  str_replace(x, "^(\\d+)\\.0+$", "\\1")
+}
+
+norm_title <- function(x) str_squish(str_to_upper(as.character(x)))
+
+load_psc_lookup <- function(path) {
+  read_dta(path) %>%
+    clean_names() %>%
+    transmute(
+      psc_code  = normalize_psc_code(psc_code),
+      psc_title = norm_title(coalesce(product_and_service_code_name, psc_name, dservicecodename))
+    ) %>%
+    filter(!is.na(psc_code) | !is.na(psc_title)) %>%
+    distinct()
+}
+
+attach_psc <- function(df, lookup, code_col = NULL, title_col = NULL) {
+  if (!is.null(code_col)) {
+    df <- df %>%
+      mutate(psc_code = normalize_psc_code(.data[[code_col]])) %>%
+      left_join(lookup, by = "psc_code")
+  } else if (!is.null(title_col)) {
+    df <- df %>%
+      mutate(psc_title = norm_title(.data[[title_col]])) %>%
+      left_join(lookup, by = "psc_title")
+  } else {
+    stop("provide code_col or title_col")
+  }
+  df
+}
+
+psc_path <- "M:/Xiaoqing/Subcontracting/psc_code.dta" # update to local PSC code file
+psc_lookup <- load_psc_lookup(psc_path)
+```
+
 Get standardized 2022 NAICS code
 
 
@@ -159,61 +200,6 @@ build_naics_prior_2022 <- function(df_std, psc_col = "product_or_service_code_de
     ungroup()
 }
 
-cw_07_12 <- read_xls(here("Data","NAICSCrosswalks","2012_to_2007_NAICS.xls"))
-cw_12_17 <- read_xlsx(here("Data","NAICSCrosswalks","2012_to_2017_NAICS.xlsx"))
-cw_17_22 <- read_xlsx(here("Data","NAICSCrosswalks","2022_to_2017_NAICS.xlsx"))
-
-cw_07_12_p <- prep_crosswalk(cw_07_12, from_col = "2007 NAICS Code", to_col = "2012 NAICS Code")
-cw_12_17_p <- prep_crosswalk(cw_12_17, from_col = "2012 NAICS Code", to_col = "2017 NAICS Code")
-cw_17_22_p <- prep_crosswalk(cw_17_22, from_col = "2017 NAICS Code", to_col = "2022 NAICS Code")
-
-std <- standardize_naics_to_2022(sub,
-                                 naics_col = "naics_code",
-                                 year_col  = "year",
-                                 cw_07_12_p = cw_07_12_p,
-                                 cw_12_17_p = cw_12_17_p,
-                                 cw_17_22_p = cw_17_22_p)
-
-std <- normalize_weights(std)
-
-
-
-std_one <- collapse_to_single_naics(std)
-naics_prior_2022 <- build_naics_prior_2022(std, psc_col = "product_or_service_code_descript",
-                                           naics_col = "naics_2022", weight_col = "weight")
-
-
-# ---------------------------------------------------------------
-# checking 
-
-std %>% 
-  dplyr::count(year, map_path) %>% 
-  arrange(year, map_path)
-
-
-orig_codes <- sub %>%
- mutate(.row_id = row_number(),
-                code_orig = stringr::str_pad(as.character(naics_code), 6, "left", "0")) %>%
- select(.row_id, code_orig)
-
-audit <- std %>%
-  left_join(orig_codes, by = ".row_id") %>%
-  mutate(changed = code_orig != naics_2022)
-
-
-audit %>% dplyr::count(changed)
-
-audit %>%
-  filter(changed) %>%
-  distinct(year, map_path, code_orig, naics_2022) %>%
-  arrange(year) %>%
-  slice_head(n = 15)
-
-
-#-----------------------------------------------------------------------------
-# Add Metadata For 2022 NAICS 
-
-
 prep_naics2022_key_from_clean <- function(df_clean) {
   df_clean %>%
     clean_names() %>%
@@ -243,93 +229,65 @@ attach_naics_titles_2022 <- function(df, code_col = "naics_2022", key_df, levels
   out %>% select(-`._code6`)
 }
 
-# usage
-key_path <- here("Data","NAICSCrosswalks","2022_codes.xlsx")
-codes2022 <- read_xlsx(key_path) %>% clean_names()
+cw_07_12 <- read_xls(here("Data","NAICSCrosswalks","2012_to_2007_NAICS.xls"))
+cw_12_17 <- read_xlsx(here("Data","NAICSCrosswalks","2012_to_2017_NAICS.xlsx"))
+cw_17_22 <- read_xlsx(here("Data","NAICSCrosswalks","2022_to_2017_NAICS.xlsx"))
+
+cw_07_12_p <- prep_crosswalk(cw_07_12, from_col = "2007 NAICS Code", to_col = "2012 NAICS Code")
+cw_12_17_p <- prep_crosswalk(cw_12_17, from_col = "2012 NAICS Code", to_col = "2017 NAICS Code")
+cw_17_22_p <- prep_crosswalk(cw_17_22, from_col = "2017 NAICS Code", to_col = "2022 NAICS Code")
+
+codes2022 <- read_xlsx(here("Data","NAICSCrosswalks","2022_codes.xlsx")) %>% clean_names()
 codes22_key <- prep_naics2022_key_from_clean(codes2022)
-std_one <- attach_naics_titles_2022(sub, code_col = "naics_2022", key_df = codes22_key, levels = c(6,3,2))
+
+apply_naics <- function(df, naics_col = "naics_code", year_col = "year") {
+  std <- standardize_naics_to_2022(df, naics_col, year_col, cw_07_12_p, cw_12_17_p, cw_17_22_p)
+  std <- normalize_weights(std)
+  std_one <- collapse_to_single_naics(std)
+  df_out <- df %>%
+    mutate(.row_id = row_number()) %>%
+    left_join(std_one %>% select(.row_id, naics_2022), by = ".row_id") %>%
+    select(-.row_id)
+  df_out <- attach_naics_titles_2022(df_out, code_col = "naics_2022", key_df = codes22_key, levels = c(6,3,2))
+  list(df = df_out, std = std)
+}
+
 
 ```
 
 
-```{r}
+```{r apply_codes}
+sub_path <- here("Data","sub_enriched.rds")
+subcontract_path <- here("Data","subcontract_enriched.rds")
 
-normalize_psc_code <- function(x) {
-  x <- as.character(x)
-  x <- str_squish(x)
-  x <- str_replace(x, "^(\\d+)\\.0+$", "\\1")
-  x
+if (file.exists(sub_path) && file.exists(subcontract_path)) {
+  sub <- read_rds(sub_path)
+  subcontract <- read_rds(subcontract_path)
+} else {
+  naics_sub <- apply_naics(sub)
+  sub <- naics_sub$df %>% attach_psc(psc_lookup, code_col = "psc_code")
+  naics_prior_2022 <- build_naics_prior_2022(naics_sub$std,
+                                             psc_col = "product_or_service_code_descript",
+                                             naics_col = "naics_2022", weight_col = "weight")
+  naics_subcontract <- apply_naics(subcontract)
+  subcontract <- naics_subcontract$df %>%
+    attach_psc(psc_lookup, title_col = "product_or_service_code_descript")
+  write_rds(sub, sub_path)
+  write_rds(subcontract, subcontract_path)
 }
-
-read_psc_2025 <- function(path, sheet = 1) {
-  hdr <- read_xlsx(path, sheet = sheet, n_max = 0)
-  ct  <- rep("guess", length(hdr)); ct[1] <- "text"
-  read_xlsx(path, sheet = sheet, col_types = ct, .name_repair = "minimal") %>%
-    clean_names() %>%
-    mutate(
-      psc_code = normalize_psc_code(psc_code),
-      product_and_service_code_name = str_squish(as.character(product_and_service_code_name)),
-      start_date = suppressWarnings(mdy(as.character(start_date))),
-      end_date   = suppressWarnings(mdy(as.character(end_date)))
-    )
-}
-
-dedupe_psc_title_to_code <- function(PSC,
-                                     code_col  = "psc_code",
-                                     title_col = "product_and_service_code_name",
-                                     start_col = "start_date",
-                                     end_col   = "end_date") {
-  PSC %>%
-    mutate(
-      code   = normalize_psc_code(.data[[code_col]]),
-      title  = as.character(.data[[title_col]]),
-      start  = suppressWarnings(mdy(.data[[start_col]])),
-      end    = suppressWarnings(mdy(.data[[end_col]])),
-      title_norm = str_squish(title),
-      code_len   = nchar(gsub("[^A-Za-z0-9]", "", code)),
-      active     = ifelse(is.na(end), 1L, 0L)
-    ) %>%
-    distinct(code, title_norm, .keep_all = TRUE) %>%
-    group_by(title_norm) %>%
-    arrange(desc(code_len), desc(active), desc(start), code, .by_group = TRUE) %>%
-    slice(1) %>%
-    ungroup() %>%
-    transmute(psc_title = title_norm, psc_code = code)
-}
-
-norm_title <- function(x) str_squish(str_to_upper(as.character(x)))
-
-
-psc_path <- "~/Downloads/PSC April 2025.xlsx"
-PSC <- read_psc_2025(psc_path)
-
-
-psc_map <- dedupe_psc_title_to_code(PSC) %>%
-  mutate(psc_title = norm_title(psc_title)) %>%
-  distinct(psc_title, .keep_all = TRUE)
-
-
-sub_with_psc_code <- subcontract %>%
-  mutate(psc_title = norm_title(product_or_service_code_descript)) %>%
-  left_join(psc_map, by = "psc_title") %>%
-  select(-psc_title)
-
-
-
 ```
-
 ```{r}
 
 
 
-summary_data_all <- std_one %>%
+summary_data_all <- sub %>%
   group_by(year, naics_2022) %>%
   summarise(
     num_contracts = n(),
     avg_contract_value = mean(nom_g, na.rm = TRUE),
     total_contract_value = sum(nom_g, na.rm = TRUE),
-    .groups = "drop") %>% 
-  left_join(std_one %>% select(naics_2022, naics6_title), join_by(naics_2022))
+    .groups = "drop") %>%
+  left_join(sub %>% select(naics_2022, naics6_title), by = "naics_2022")
 
 top_5_naics_value <- summary_data_all %>%
   group_by(naics6_title) %>%
@@ -398,6 +356,7 @@ overall %>%
 
 ```
 
+
 ```{r}
 
 overall %>%
@@ -409,6 +368,7 @@ overall %>%
 
 
 ```
+
 
 ```{r}
 
@@ -422,6 +382,7 @@ overall %>%
   theme_clean
 
 ```
+
 
 ```{r}
 
@@ -524,9 +485,9 @@ theme_clean <- theme_minimal(base_size = 12) +
         legend.text  = element_text(size = 9),
         axis.text.x  = element_text(angle = 45, hjust = 1))
 
-sub_prep <- std_one %>%
+sub_prep <- sub %>%
   mutate(prime_date = as.Date(prime_date),
-         year = year(prime_date)) 
+         year = year(prime_date))
 
 summary_data_all <- sub_prep %>%
   group_by(year, naics6_title) %>%
@@ -610,12 +571,12 @@ So for ex., if you were categorizing news, then the words "football" and "player
 
 chat <- ellmer::chat_google_gemini()
 
-contracts <- subcontracts %>%
+contracts <- subcontract %>%
   mutate(
     obs_id        = as.character(prime_id_num),
     broad_cat     = product_or_service_code_descript,
     specific_desc = subaward_description,
-    naics         = naics_title
+    naics         = naics6_title
   ) %>%
   select(obs_id, broad_cat, specific_desc, naics) %>%
   distinct(obs_id, .keep_all = TRUE)
