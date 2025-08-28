@@ -31,6 +31,7 @@ library(haven)
 library(readxl)
 library(readr)
 library(jsonlite)
+library(janitor)
 library(purrr)
 library(lubridate)
 library(quanteda)  
@@ -56,37 +57,203 @@ library(scales)
 
 options(scipen = 999)
 
+
+# full set of obs to run data exploration. sliced so the observation level is primary contract. 
+# Data exploration primary df name is "sub" 
 # sub <- read_dta("M:/Xiaoqing/Subcontracting/forNLP.dta")
-# subcontracts <- read_dta("M:/Xiaoqing/Subcontracting/forNLP_2.dta")
-# saveRDS(subcontracts, "subcontracts.RDS")
-# sub <- read_rds(here("subcontracts.RDS"))
 
-NAICS <- read_excel(here("NAICS.xlsx"))
+# sub <- sub %>%  
+#   group_by(prime_id) %>% 
+#   slice_head(n=1) %>% 
+#   ungroup()
 
-
- # sub <- left_join(sub, NAICS, 
- #       join_by(naics_code)) %>% 
- #       mutate(year = year(date(prime_date)))
+# sub <- sub %>% 
+#   mutate(year = year(date(prime_date)))
 
 
-# twos <- sub %>% 
-#   select(product_or_service_code_descript, subaward_description, naics_title, prime_id_num)
 
-sub <- sub %>%  
-  group_by(prime_id) %>% 
-  slice_head(n=1) %>% 
-  ungroup()
+# Deduped, this is for text processing on the sub description 
+# the primary df name for text processing is "subcontract"
+# subcontract <- read_rds(here("subcontracts.RDS"))
 
-twos <- sub %>% 
-  select(product_or_service_code_descript, subaward_description, naics_title, prime_id_num)
-
-subcontracts <-subcontracts %>% 
- left_join(NAICS %>% select(naics_code, naics_title), join_by(naics_code))
-
-sub <- sub %>% 
-  mutate(year = year(date(prime_date))) %>% 
-  left_join(NAICS %>% select(naics_code, naics_title), join_by(naics_code))
 ```
+
+Get standardized 2022 NAICS code
+
+
+```{r}
+
+
+rev_for_year <- function(y) dplyr::case_when(y <= 2011 ~ 2007L,
+                                             y <= 2016 ~ 2012L,
+                                             y <= 2021 ~ 2017L,
+                                             TRUE ~ 2022L)
+
+prep_crosswalk <- function(cw, from_col, to_col, weight_col = NULL) {
+  cw %>%
+    transmute(from = str_pad(as.character(.data[[from_col]]), 6, "left", "0"),
+              to   = str_pad(as.character(.data[[to_col]]),   6, "left", "0"),
+              w    = if (is.null(weight_col)) NA_real_ else suppressWarnings(as.numeric(.data[[weight_col]]))) %>%
+    filter(nzchar(from), nzchar(to)) %>%
+    distinct(from, to, .keep_all = TRUE) %>%
+    group_by(from) %>%
+    mutate(w = ifelse(is.na(w), 1/dplyr::n(), w / sum(w, na.rm = TRUE))) %>%
+    ungroup()
+}
+
+map_step <- function(df, cw, rev_from, rev_to) {
+  a <- df %>% filter(rev == rev_from)
+  b <- df %>% filter(rev != rev_from)
+  if (nrow(a) == 0) return(df)
+  a %>%
+    mutate(code = str_pad(as.character(code), 6, "left", "0")) %>%
+    left_join(cw, by = c("code" = "from"), relationship = "many-to-many") %>%
+    mutate(code = dplyr::coalesce(to, code),
+           weight = weight * dplyr::coalesce(w, 1),
+           rev = ifelse(is.na(to), rev, rev_to),
+           map_path = ifelse(is.na(to), map_path, paste0(map_path, "|", rev_from, "→", rev_to))) %>%
+    select(-to, -w) %>%
+    bind_rows(b, .)
+}
+
+standardize_naics_to_2022 <- function(df, naics_col = "naics_code", year_col = "year",
+                                      cw_07_12_p, cw_12_17_p, cw_17_22_p) {
+  base <- df %>%
+    mutate(.row_id = row_number(),
+           code = str_pad(as.character(.data[[naics_col]]), 6, "left", "0"),
+           rev = rev_for_year(as.integer(.data[[year_col]])),
+           weight = 1.0,
+           map_path = "orig")
+  s1 <- map_step(base, cw_07_12_p, 2007L, 2012L)
+  s2 <- map_step(s1,   cw_12_17_p, 2012L, 2017L)
+  s3 <- map_step(s2,   cw_17_22_p, 2017L, 2022L)
+  s3 %>% mutate(naics_2022 = code)
+}
+
+normalize_weights <- function(df) {
+  df %>%
+    group_by(.row_id) %>%
+    mutate(weight = ifelse(sum(weight, na.rm = TRUE) > 0, weight / sum(weight, na.rm = TRUE), weight)) %>%
+    ungroup()
+}
+
+collapse_to_single_naics <- function(df_std) {
+  df_std %>%
+    group_by(.row_id) %>%
+    slice_max(order_by = weight, n = 1, with_ties = FALSE) %>%
+    ungroup()
+}
+
+split_merge_stats <- function(df_std) {
+  df_std %>% dplyr::count(.row_id, name = "k") %>%
+    summarise(no_split = sum(k == 1), split = sum(k > 1), max_branches = max(k))
+}
+
+build_naics_prior_2022 <- function(df_std, psc_col = "product_or_service_code_descript",
+                                   naics_col = "naics_2022", weight_col = "weight") {
+  df_std %>%
+    filter(!is.na(.data[[naics_col]]), !is.na(.data[[psc_col]])) %>%
+    group_by(.data[[naics_col]], .data[[psc_col]]) %>%
+    summarise(n = sum(.data[[weight_col]]), .groups = "drop_last") %>%
+    group_by(.data[[naics_col]]) %>%
+    mutate(p = n / sum(n)) %>%
+    ungroup()
+}
+
+cw_07_12 <- read_xls(here("Data","NAICSCrosswalks","2012_to_2007_NAICS.xls"))
+cw_12_17 <- read_xlsx(here("Data","NAICSCrosswalks","2012_to_2017_NAICS.xlsx"))
+cw_17_22 <- read_xlsx(here("Data","NAICSCrosswalks","2022_to_2017_NAICS.xlsx"))
+
+cw_07_12_p <- prep_crosswalk(cw_07_12, from_col = "2007 NAICS Code", to_col = "2012 NAICS Code")
+cw_12_17_p <- prep_crosswalk(cw_12_17, from_col = "2012 NAICS Code", to_col = "2017 NAICS Code")
+cw_17_22_p <- prep_crosswalk(cw_17_22, from_col = "2017 NAICS Code", to_col = "2022 NAICS Code")
+
+std <- standardize_naics_to_2022(subcontract,
+                                 naics_col = "naics_code",
+                                 year_col  = "year",
+                                 cw_07_12_p = cw_07_12_p,
+                                 cw_12_17_p = cw_12_17_p,
+                                 cw_17_22_p = cw_17_22_p)
+
+sub <- normalize_weights(std)
+
+
+
+std_one <- collapse_to_single_naics(std)
+naics_prior_2022 <- build_naics_prior_2022(std, psc_col = "product_or_service_code_descript",
+                                           naics_col = "naics_2022", weight_col = "weight")
+
+
+# ---------------------------------------------------------------
+# checking 
+
+std %>% 
+  dplyr::count(year, map_path) %>% 
+  arrange(year, map_path)
+
+
+orig_codes <- subcontract %>%
+ mutate(.row_id = row_number(),
+                code_orig = stringr::str_pad(as.character(naics_code), 6, "left", "0")) %>%
+ select(.row_id, code_orig)
+
+audit <- std %>%
+  left_join(orig_codes, by = ".row_id") %>%
+  mutate(changed = code_orig != naics_2022)
+
+
+audit %>% dplyr::count(changed)
+
+audit %>%
+  filter(changed) %>%
+  distinct(year, map_path, code_orig, naics_2022) %>%
+  arrange(year) %>%
+  slice_head(n = 15)
+
+
+#-----------------------------------------------------------------------------
+# Add Metadata For 2022 NAICS 
+
+
+prep_naics2022_key_from_clean <- function(df_clean) {
+  df_clean %>%
+    clean_names() %>%
+    transmute(code  = as.character(x2022_naics_us_code),
+              title = as.character(x2022_naics_us_title)) %>%
+    mutate(code = trimws(code), title = trimws(title)) %>%
+    filter(!is.na(code), !is.na(title), code != "", title != "") %>%
+    distinct(code, .keep_all = TRUE)
+}
+
+attach_naics_titles_2022 <- function(df, code_col = "naics_2022", key_df, levels = c(6,3,2), keep_codes = FALSE) {
+  if (!all(c("code","title") %in% names(key_df))) {
+    key_df <- prep_naics2022_key_from_clean(key_df)
+  }
+  key_df <- key_df %>% mutate(code = as.character(code), n = nchar(code)) %>% filter(n %in% levels) %>% distinct(code, .keep_all = TRUE)
+  out <- df %>% mutate(`._code6` = substr(as.character(.data[[code_col]]), 1, 6))
+  for (L in levels) {
+    look <- key_df %>% filter(n == L) %>% select(code, title)
+    col_code  <- paste0("naics", L, "_code")
+    col_title <- paste0("naics", L, "_title")
+    out <- out %>%
+      mutate(!!col_code := substr(`._code6`, 1, L)) %>%
+      left_join(look, by = setNames("code", col_code)) %>%
+      rename(!!col_title := title)
+    if (!keep_codes) out <- out %>% select(-all_of(col_code))
+  }
+  out %>% select(-`._code6`)
+}
+
+# usage
+key_path <- here("Data","NAICSCrosswalks","2022_codes.xlsx")
+codes2022 <- read_xlsx(key_path) %>% clean_names()
+codes22_key <- prep_naics2022_key_from_clean(codes2022)
+std_one <- attach_naics_titles_2022(sub, code_col = "naics_2022", key_df = codes22_key, levels = c(6,3,2))
+
+
+
+```
+
 
 ```{r}
 
@@ -496,8 +663,8 @@ run_llm_over_df <- function(df, broad_col, specific_col,
 # Initializing Checkpoint Files
 #-------------------------------------------------
 
-readable_ckpt <- here::here("Checkpoints/readable_checkpoint.rds")
-relation_ckpt <- here::here("Checkpoints/relation_checkpoint.rds")
+readable_ckpt <- here("Checkpoints/readable_checkpoint.rds")
+relation_ckpt <- here("Checkpoints/relation_checkpoint.rds")
 
 if (!file.exists(readable_ckpt)) {
   write_rds(

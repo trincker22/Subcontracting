@@ -402,6 +402,126 @@ expand_with_lexicon <- function(text, lex, tau = 0.4){
 texts_expanded <- expand_with_lexicon(texts, acr_lexicon, tau = 0.4)
 
 
+glimpse(subcontract)
+```
+
+
+
+
+```{r}
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(tidytext)
+
+make_psc_query <- function(df,
+                           subawardee_col = "subawardee_name",
+                           raw_desc_col  = "subaward_description",
+                           expanded_col  = NULL,
+                           max_chars     = 250) {
+  
+  desc_col <- if (!is.null(expanded_col) && expanded_col %in% names(df)) {
+    expanded_col
+  } else if ("desc_expanded" %in% names(df)) {
+    "desc_expanded"
+  } else {
+    raw_desc_col
+  }
+  
+  base <- df %>%
+    mutate(.doc_id = row_number(),
+           .subawardee = .data[[subawardee_col]] %>% as.character() %>% coalesce(""),
+           .desc = .data[[desc_col]] %>% as.character() %>% coalesce("")) %>%
+    mutate(.desc = str_squish(.desc))
+  
+  # Break into sentences
+  sent_df <- base %>%
+    mutate(.sent_list = str_split(.desc, boundary("sentence"))) %>%
+    select(.doc_id, .subawardee, .sent_list) %>%
+    unnest_longer(.sent_list, values_to = ".sentence", keep_empty = TRUE) %>%
+    mutate(.sentence = str_squish(.sentence))
+  
+  # Tokenize and compute tf-idf
+  word_df <- sent_df %>%
+    filter(nchar(.sentence) > 0) %>%
+    unnest_tokens(word, .sentence, token = "words", drop = FALSE) %>%
+    filter(!word %in% stop_words$word, !str_detect(word, "^[0-9]+$")) %>%
+    group_by(.doc_id, .sentence) %>%
+    dplyr::count(word, name = "term_n") %>%
+    ungroup() %>%
+    bind_tf_idf(word, .doc_id, term_n)
+  
+  # Sentence scores
+  sent_scores <- word_df %>%
+    group_by(.doc_id, .sentence) %>%
+    summarise(score = sum(tf_idf, na.rm = TRUE), .groups = "drop")
+  
+  # Pick top text per doc
+  best_text <- sent_df %>%
+    left_join(sent_scores, by = c(".doc_id", ".sentence")) %>%
+    mutate(score = coalesce(score, 0)) %>%
+    group_by(.doc_id) %>%
+    arrange(desc(score), .sentence, .by_group = TRUE) %>%
+    summarise(.best = paste(.sentence[nchar(.sentence) > 0], collapse = " "),
+              .subawardee = first(.subawardee),
+              .groups = "drop") %>%
+    mutate(.best = ifelse(is.na(.best), "", str_squish(.best)))
+  
+  out <- best_text %>%
+    mutate(.prefix = ifelse(nchar(.subawardee) > 0, paste0(.subawardee, ": "), ""),
+           .room   = pmax(0, max_chars - nchar(.prefix)),
+           .body   = ifelse(nchar(.best) > 0, str_sub(.best, 1L, .room), ""),
+           psc_query_250 = str_squish(paste0(.prefix, .body))) %>%
+    select(.doc_id, psc_query_250)
+  
+  # Fallback: truncate raw concat
+  fallback <- base %>%
+    transmute(.doc_id,
+              fallback_text = str_squish(paste0(.subawardee,
+                                                ifelse(nchar(.subawardee) > 0, ": ", ""),
+                                                .desc)) %>% str_sub(1L, max_chars))
+  
+  final <- out %>%
+    left_join(fallback, by = ".doc_id") %>%
+    mutate(psc_query_250 = ifelse(nchar(psc_query_250) == 0, fallback_text, psc_query_250)) %>%
+    select(.doc_id, psc_query_250)
+  
+  df %>%
+    mutate(.doc_id = row_number()) %>%
+    left_join(final, by = ".doc_id") %>%
+    select(-.doc_id)
+}
+
+# Example:
+# subcontract <- readRDS("Data/subcontract.RDS")
+dat <- make_psc_query(subcontract,
+                      subawardee_col = "subawardee_name",
+                      raw_desc_col   = "subaward_description")
+head(dat$psc_query_250)
+
+
+vec <- dat %>% 
+    select(psc_query_250)
+
+```
+
+
+
+
+```{r}
+
+
+
+
+```
+
+
+
+```{r}
+
+
+
+
 ```
 
 
