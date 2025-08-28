@@ -17,3 +17,7 @@ Thumbs.db
 
 .Renviron
 subcontracts.RDS
+runs/psc/snapshots/preds_20250828_153959.csv
+runs/psc/outputs/top1_subset400.rds
+runs/psc/outputs/preds_topk_subset400.rds
+runs/psc/cache/cache_subset400.rds
