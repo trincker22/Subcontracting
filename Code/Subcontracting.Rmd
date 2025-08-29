@@ -40,11 +40,23 @@ library(scales)
 
 options(scipen = 999)
 
+# load in subcontracts
+
 
 ```
 
+
+# Preprocessing Chunk: Add NAICS and PSC Vars, Compute Priors. 
+
 ```{r}
 
+# toggles
+force_recompute <- T
+run_priors      <- T
+
+# ----------------------------
+# helpers
+# ----------------------------
 rev_for_year <- function(y) dplyr::case_when(y <= 2011 ~ 2007L,
                                              y <= 2016 ~ 2012L,
                                              y <= 2021 ~ 2017L,
@@ -69,9 +81,9 @@ map_step <- function(df, cw, rev_from, rev_to) {
   a %>%
     mutate(code = str_pad(as.character(code), 6, "left", "0")) %>%
     left_join(cw, by = c("code" = "from"), relationship = "many-to-many") %>%
-    mutate(code = dplyr::coalesce(to, code),
-           weight = weight * dplyr::coalesce(w, 1),
-           rev = ifelse(is.na(to), rev, rev_to),
+    mutate(code   = coalesce(to, code),
+           weight = weight * coalesce(w, 1),
+           rev    = ifelse(is.na(to), rev, rev_to),
            map_path = ifelse(is.na(to), map_path, paste0(map_path, "|", rev_from, "→", rev_to))) %>%
     select(-to, -w) %>%
     bind_rows(b, .)
@@ -92,33 +104,14 @@ standardize_naics_to_2022 <- function(df, naics_col = "naics_code", year_col = "
 }
 
 normalize_weights <- function(df) {
-  df %>%
-    group_by(.row_id) %>%
-    mutate(weight = ifelse(sum(weight, na.rm = TRUE) > 0, weight / sum(weight, na.rm = TRUE), weight)) %>%
+  df %>% group_by(.row_id) %>%
+    mutate(weight = ifelse(sum(weight, na.rm = TRUE) > 0,
+                           weight / sum(weight, na.rm = TRUE), weight)) %>%
     ungroup()
 }
 
 collapse_to_single_naics <- function(df_std) {
-  df_std %>%
-    group_by(.row_id) %>%
-    slice_max(order_by = weight, n = 1, with_ties = FALSE) %>%
-    ungroup()
-}
-
-split_merge_stats <- function(df_std) {
-  df_std %>% dplyr::count(.row_id, name = "k") %>%
-    summarise(no_split = sum(k == 1), split = sum(k > 1), max_branches = max(k))
-}
-
-build_naics_prior_2022 <- function(df_std, psc_col = "product_or_service_code_descript",
-                                   naics_col = "naics_2022", weight_col = "weight") {
-  df_std %>%
-    filter(!is.na(.data[[naics_col]]), !is.na(.data[[psc_col]])) %>%
-    group_by(.data[[naics_col]], .data[[psc_col]]) %>%
-    summarise(n = sum(.data[[weight_col]]), .groups = "drop_last") %>%
-    group_by(.data[[naics_col]]) %>%
-    mutate(p = n / sum(n)) %>%
-    ungroup()
+  df_std %>% group_by(.row_id) %>% slice_max(order_by = weight, n = 1, with_ties = FALSE) %>% ungroup()
 }
 
 prep_naics2022_key_from_clean <- function(df_clean) {
@@ -132,9 +125,7 @@ prep_naics2022_key_from_clean <- function(df_clean) {
 }
 
 attach_naics_titles_2022 <- function(df, code_col = "naics_2022", key_df, levels = c(6,3,2), keep_codes = FALSE) {
-  if (!all(c("code","title") %in% names(key_df))) {
-    key_df <- prep_naics2022_key_from_clean(key_df)
-  }
+  if (!all(c("code","title") %in% names(key_df))) key_df <- prep_naics2022_key_from_clean(key_df)
   key_df <- key_df %>% mutate(code = as.character(code), n = nchar(code)) %>% filter(n %in% levels) %>% distinct(code, .keep_all = TRUE)
   out <- df %>% mutate(`._code6` = substr(as.character(.data[[code_col]]), 1, 6))
   for (L in levels) {
@@ -151,10 +142,7 @@ attach_naics_titles_2022 <- function(df, code_col = "naics_2022", key_df, levels
 }
 
 normalize_psc_code <- function(x) {
-  x <- as.character(x)
-  x <- str_squish(x)
-  x <- str_replace(x, "^(\\d+)\\.0+$", "\\1")
-  x
+  x <- as.character(x); x <- str_squish(x); x <- str_replace(x, "^(\\d+)\\.0+$", "\\1"); x
 }
 
 read_psc_2025 <- function(path, sheet = 1) {
@@ -179,8 +167,8 @@ dedupe_psc_title_to_code <- function(PSC,
     mutate(
       code   = normalize_psc_code(.data[[code_col]]),
       title  = as.character(.data[[title_col]]),
-      start  = suppressWarnings(mdy(.data[[start_col]])),
-      end    = suppressWarnings(mdy(.data[[end_col]])),
+      start  = suppressWarnings(mdy(as.character(.data[[start_col]]))),
+      end    = suppressWarnings(mdy(as.character(.data[[end_col]]))),
       title_norm = str_squish(title),
       code_len   = nchar(gsub("[^A-Za-z0-9]", "", code)),
       active     = ifelse(is.na(end), 1L, 0L)
@@ -195,164 +183,170 @@ dedupe_psc_title_to_code <- function(PSC,
 
 norm_title <- function(x) str_squish(str_to_upper(as.character(x)))
 
-theme_clean <- theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom",
-        legend.title = element_text(size = 10),
-        legend.text  = element_text(size = 9),
-        axis.text.x  = element_text(angle = 45, hjust = 1))
-scale_color_wrapped <- scale_color_discrete(labels = ~ stringr::str_wrap(.x, 28))
-scale_fill_wrapped  <- scale_fill_discrete(labels  = ~ stringr::str_wrap(.x, 28))
+ensure_dir <- function(path) { if (!fs::dir_exists(path)) fs::dir_create(path, recurse = TRUE); path }
 
-
-```
-
-```{r}
-
-if (exists("subcontract") && !exists("subcontracts")) {
-  subcontracts <- subcontract
+attach_psc <- function(df, psc_map) {
+  if (!"product_or_service_code_descript" %in% names(df)) {
+    alt_psc <- intersect(c("product_or_service_code_description","psc_description","psc_title"),
+                         names(df))
+    if (length(alt_psc) == 1) df <- df %>% rename(product_or_service_code_descript = !!alt_psc)
+  }
+  if ("product_or_service_code_descript" %in% names(df)) {
+    df <- df %>%
+      mutate(psc_title = norm_title(product_or_service_code_descript)) %>%
+      left_join(psc_map, by = "psc_title") %>%
+      select(-psc_title)
+  }
+  df
 }
-stopifnot(exists("subcontracts"))
 
-if ("prime_id" %in% names(subcontracts)) {
-  sub <- subcontracts %>%
-    group_by(prime_id) %>%
-    slice_head(n = 1) %>%
-    ungroup()
-} else if ("prime_id_num" %in% names(subcontracts)) {
-  sub <- subcontracts %>%
-    group_by(prime_id_num) %>%
-    slice_head(n = 1) %>%
-    ungroup()
+attach_naics <- function(df, cw_07_12_p, cw_12_17_p, cw_17_22_p, codes22_key) {
+  if (!"year" %in% names(df) & "prime_date" %in% names(df)) {
+    df <- df %>% mutate(prime_date = suppressWarnings(as.Date(prime_date)),
+                        year = year(prime_date))
+  }
+  if (!"naics_code" %in% names(df)) return(df)
+  std <- standardize_naics_to_2022(df, naics_col = "naics_code", year_col = "year",
+                                   cw_07_12_p = cw_07_12_p, cw_12_17_p = cw_12_17_p, cw_17_22_p = cw_17_22_p)
+  std <- normalize_weights(std)
+  std_one <- collapse_to_single_naics(std)
+  std_one <- attach_naics_titles_2022(std_one, code_col = "naics_2022",
+                                      key_df = codes22_key, levels = c(6,3,2))
+  df %>% mutate(.row_id = row_number()) %>%
+    left_join(std_one %>% select(.row_id, naics_2022, naics6_title, naics3_title, naics2_title),
+              by = ".row_id") %>%
+    select(-.row_id)
+}
+
+process_one_df <- function(df, source_name = "subcontracts",
+                           cw_07_12_p, cw_12_17_p, cw_17_22_p, codes22_key, psc_map) {
+  key_candidate <- intersect(c("prime_id_num","prime_id"), names(df))
+  if (length(key_candidate) >= 1) {
+    best_key <- key_candidate[1]
+    df <- df %>% mutate(obs_id = as.character(.data[[best_key]]))
+  } else {
+    df <- df %>% mutate(obs_id = as.character(row_number()))
+  }
+  if ("prime_date" %in% names(df)) {
+    df <- df %>% mutate(prime_date = suppressWarnings(as.Date(prime_date)),
+                        year = if (!"year" %in% names(df)) year(prime_date) else year)
+  }
+  if (!"nom_g" %in% names(df)) {
+    valcand <- intersect(c("obligated_amount","action_obligation","amount","value"),
+                         names(df))
+    if (length(valcand) == 1) df <- df %>% rename(nom_g = !!valcand)
+  }
+  df <- attach_naics(df, cw_07_12_p, cw_12_17_p, cw_17_22_p, codes22_key)
+  df <- attach_psc(df, psc_map)
+  df
+}
+
+# ----------------------------
+# paths / cache
+# ----------------------------
+cw_07_12 <- here("Data","NAICSCrosswalks","2012_to_2007_NAICS.xls")
+cw_12_17 <- here("Data","NAICSCrosswalks","2012_to_2017_NAICS.xlsx")
+cw_17_22 <- here("Data","NAICSCrosswalks","2022_to_2017_NAICS.xlsx")
+key_path  <- here("Data","NAICSCrosswalks","2022_codes.xlsx")
+psc_path  <- here("Data","PSC0425.xlsx")
+
+cache_dir <- ensure_dir(here("Data","processed"))
+cache_primary_path      <- file.path(cache_dir, "primary.rds")
+cache_subcontracts_path <- file.path(cache_dir, "subcontracts.rds")
+
+# ----------------------------
+# lookups
+# ----------------------------
+cw_07_12_p <- if (file.exists(cw_07_12)) prep_crosswalk(read_xls(cw_07_12), from_col = "2007 NAICS Code", to_col = "2012 NAICS Code") else NULL
+cw_12_17_p <- if (file.exists(cw_12_17)) prep_crosswalk(read_xlsx(cw_12_17), from_col = "2012 NAICS Code", to_col = "2017 NAICS Code") else NULL
+cw_17_22_p <- if (file.exists(cw_17_22)) prep_crosswalk(read_xlsx(cw_17_22), from_col = "2017 NAICS Code", to_col = "2022 NAICS Code") else NULL
+
+codes2022  <- if (file.exists(key_path)) read_xlsx(key_path) %>% clean_names() else tibble(code=character(), title=character())
+codes22_key <- if (nrow(codes2022)) prep_naics2022_key_from_clean(codes2022) else tibble(code=character(), title=character())
+
+PSC <- if (file.exists(psc_path)) read_psc_2025(psc_path) else tibble()
+psc_map <- if (nrow(PSC)) dedupe_psc_title_to_code(PSC) %>%
+  mutate(psc_title = norm_title(psc_title)) %>% distinct(psc_title, .keep_all = TRUE) else
+  tibble(psc_title=character(), psc_code=character())
+
+# ----------------------------
+# process: subcontracts
+# ----------------------------
+if (file.exists(cache_subcontracts_path) & !force_recompute) {
+  subcontracts <- readRDS(cache_subcontracts_path)
+} else if (exists("subcontracts")) {
+  subcontracts <- process_one_df(subcontracts, "subcontracts",
+                                 cw_07_12_p, cw_12_17_p, cw_17_22_p,
+                                 codes22_key, psc_map)
+  saveRDS(subcontracts, cache_subcontracts_path)
+}
+
+# ----------------------------
+# process: primary
+# ----------------------------
+create_primary_from_subcontracts <- function(sc) {
+  if ("prime_id" %in% names(sc)) {
+    sc %>% group_by(prime_id) %>% slice_head(n = 1) %>% ungroup()
+  } else if ("prime_id_num" %in% names(sc)) {
+    sc %>% group_by(prime_id_num) %>% slice_head(n = 1) %>% ungroup()
+  } else {
+    sc %>% distinct(.keep_all = TRUE)
+  }
+}
+
+if (file.exists(cache_primary_path) & !force_recompute) {
+  primary <- readRDS(cache_primary_path)
 } else {
-  sub <- subcontracts %>% distinct(.keep_all = TRUE)
-}
-
-key_candidate <- intersect(c("prime_id_num","prime_id"), names(subcontracts))
-stopifnot(length(key_candidate) >= 1)
-best_key <- key_candidate[1]
-
-subcontracts <- subcontracts %>% mutate(obs_id = as.character(.data[[best_key]]))
-sub <- sub %>% mutate(obs_id = as.character(.data[[best_key]]))
-
-coerce_date <- function(x) suppressWarnings(as.Date(x))
-if ("prime_date" %in% names(subcontracts)) {
-  subcontracts <- subcontracts %>% mutate(prime_date = coerce_date(prime_date),
-                                          year = lubridate::year(prime_date))
-}
-if ("prime_date" %in% names(sub)) {
-  sub <- sub %>% mutate(prime_date = coerce_date(prime_date),
-                        year = lubridate::year(prime_date))
-}
-
-if (!"nom_g" %in% names(subcontracts)) {
-  valcand <- intersect(c("obligated_amount","action_obligation","amount","value"), names(subcontracts))
-  if (length(valcand) == 1) {
-    subcontracts <- subcontracts %>% rename(nom_g = !!valcand)
+  if (!exists("primary") && exists("subcontracts")) {
+    primary <- create_primary_from_subcontracts(subcontracts)
   }
-}
-if (!"nom_g" %in% names(sub) && "nom_g" %in% names(subcontracts)) {
-  keep_cols <- intersect(c("obs_id","nom_g"), names(subcontracts))
-  sub <- sub %>% select(-any_of("nom_g")) %>% left_join(subcontracts %>% select(any_of(keep_cols)), by="obs_id")
-}
-
-if (!"product_or_service_code_descript" %in% names(subcontracts)) {
-  alt_psc <- intersect(c("product_or_service_code_description","psc_description","psc_title"), names(subcontracts))
-  if (length(alt_psc) == 1) {
-    subcontracts <- subcontracts %>%
-      rename(product_or_service_code_descript = !!alt_psc)
+  if (exists("primary")) {
+    primary <- process_one_df(primary, "primary",
+                              cw_07_12_p, cw_12_17_p, cw_17_22_p,
+                              codes22_key, psc_map)
+    saveRDS(primary, cache_primary_path)
   }
 }
 
-if (!"naics_code" %in% names(sub)) {
-  if ("naics_code" %in% names(subcontracts)) {
-    sub <- sub %>% select(-any_of("naics_code")) %>%
-      left_join(subcontracts %>% select(obs_id, naics_code), by = "obs_id")
+naics_key6 <- primary %>% distinct(naics_2022, naics6_title)
+
+# ----------------------------
+# priors / audit if run_priors=T
+# ----------------------------
+if (run_priors) {
+  if (exists("subcontracts") && "naics_2022" %in% names(subcontracts) &&
+      "product_or_service_code_descript" %in% names(subcontracts)) {
+    naics_prior_2022 <- subcontracts %>%
+      filter(!is.na(naics_2022), !is.na(product_or_service_code_descript)) %>%
+      group_by(naics_2022, product_or_service_code_descript) %>%
+      summarise(n = dplyr::n(), .groups = "drop_last") %>%
+      group_by(naics_2022) %>%
+      mutate(p = n / sum(n)) %>%
+      ungroup()
   }
-}
-if (!"year" %in% names(sub) && "year" %in% names(subcontracts)) {
-  sub <- sub %>% left_join(subcontracts %>% select(obs_id, year), by = "obs_id")
+  if (exists("primary") && "naics_code" %in% names(primary) && "naics_2022" %in% names(primary)) {
+    audit <- primary %>%
+      mutate(code_orig = str_pad(as.character(naics_code), 6, "left", "0"),
+             changed  = !is.na(naics_2022) & code_orig != naics_2022) %>%
+      select(obs_id, year, code_orig, naics_2022, changed)
+  }
 }
 
 
 ```
 
+
+# Data Visualization 
 ```{r}
 
-cw_07_12 <- read_xls(here("Data","NAICSCrosswalks","2012_to_2007_NAICS.xls"))
-cw_12_17 <- read_xlsx(here("Data","NAICSCrosswalks","2012_to_2017_NAICS.xlsx"))
-cw_17_22 <- read_xlsx(here("Data","NAICSCrosswalks","2022_to_2017_NAICS.xlsx"))
-
-cw_07_12_p <- prep_crosswalk(cw_07_12, from_col = "2007 NAICS Code", to_col = "2012 NAICS Code")
-cw_12_17_p <- prep_crosswalk(cw_12_17, from_col = "2012 NAICS Code", to_col = "2017 NAICS Code")
-cw_17_22_p <- prep_crosswalk(cw_17_22, from_col = "2017 NAICS Code", to_col = "2022 NAICS Code")
-
-std <- standardize_naics_to_2022(sub,
-                                 naics_col = "naics_code",
-                                 year_col  = "year",
-                                 cw_07_12_p = cw_07_12_p,
-                                 cw_12_17_p = cw_12_17_p,
-                                 cw_17_22_p = cw_17_22_p)
-
-std <- normalize_weights(std)
-std_one <- collapse_to_single_naics(std)
-
-key_path <- here("Data","NAICSCrosswalks","2022_codes.xlsx")
-codes2022 <- read_xlsx(key_path) %>% clean_names()
-codes22_key <- prep_naics2022_key_from_clean(codes2022)
-std_one <- attach_naics_titles_2022(std_one, code_col = "naics_2022", key_df = codes22_key, levels = c(6,3,2))
-
-naics_prior_2022 <- build_naics_prior_2022(std, psc_col = "product_or_service_code_descript",
-                                           naics_col = "naics_2022", weight_col = "weight")
-
-std %>% dplyr::count(year, map_path) %>% arrange(year, map_path)
-
-orig_codes <- sub %>%
-  mutate(.row_id = row_number(),
-         code_orig = stringr::str_pad(as.character(naics_code), 6, "left", "0")) %>%
-  select(.row_id, code_orig)
-
-audit <- std %>%
-  left_join(orig_codes, by = ".row_id") %>%
-  mutate(changed = code_orig != naics_2022)
-
-audit %>% dplyr::count(changed)
-
-audit %>%
-  filter(changed) %>%
-  distinct(year, map_path, code_orig, naics_2022) %>%
-  arrange(year) %>%
-  slice_head(n = 15)
-
-psc_path <- "~/Downloads/PSC April 2025.xlsx"
-PSC <- read_psc_2025(psc_path)
-
-psc_map <- dedupe_psc_title_to_code(PSC) %>%
-  mutate(psc_title = norm_title(psc_title)) %>%
-  distinct(psc_title, .keep_all = TRUE)
-
-subcontracts <- subcontracts %>%
-  mutate(psc_title = norm_title(product_or_service_code_descript)) %>%
-  left_join(psc_map, by = "psc_title") %>%
-  select(-psc_title)
-
-
-```
-
-```{r}
-
-naics_key6 <- std_one %>% distinct(naics_2022, naics6_title)
-
-summary_data_all <- std_one %>%
-  group_by(year, naics_2022) %>%
+summary_data_all <- primary %>%
+  group_by(year, naics_2022, naics6_title) %>%
   summarise(
-    num_contracts = n(),
+    num_contracts = dplyr::n(),
     avg_contract_value = mean(nom_g, na.rm = TRUE),
     total_contract_value = sum(nom_g, na.rm = TRUE),
     .groups = "drop"
-  ) %>%
-  left_join(naics_key6, by = "naics_2022", relationship = "many-to-one")
-
-
+  )
 
 top_5_naics_value <- summary_data_all %>%
   group_by(naics6_title) %>%
@@ -377,23 +371,36 @@ yoy_change_data <- filtered_summary_top5_value %>%
   group_by(naics6_title) %>%
   arrange(year, .by_group = TRUE) %>%
   mutate(
-    yoy_num_contracts = 100 * (num_contracts / lag(num_contracts) - 1),
-    yoy_total_contract_value = 100 * (total_contract_value / lag(total_contract_value) - 1)
+    yoy_num_contracts = 100 * (num_contracts / dplyr::lag(num_contracts) - 1),
+    yoy_total_contract_value = 100 * (total_contract_value / dplyr::lag(total_contract_value) - 1)
   ) %>%
   ungroup()
 
-overall <- sub %>%
+overall <- primary %>%
   group_by(year) %>%
   summarise(
-    num_contracts = n(),
+    num_contracts = dplyr::n(),
     total_value   = sum(nom_g, na.rm = TRUE),
     .groups = "drop"
   ) %>%
   arrange(year) %>%
   mutate(
-    yoy_num = 100 * (num_contracts / lag(num_contracts) - 1),
-    yoy_val = 100 * (total_value   / lag(total_value)   - 1)
+    yoy_num = 100 * (num_contracts / dplyr::lag(num_contracts) - 1),
+    yoy_val = 100 * (total_value   / dplyr::lag(total_value)   - 1)
   )
+
+wrap_legend <- function(x, width = 28) stringr::str_wrap(x, width = width)
+legend_guide_bottom <- guides(color = guide_legend(nrow = 2, byrow = TRUE),
+                              fill  = guide_legend(nrow = 2, byrow = TRUE))
+theme_clean <- theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 10),
+        legend.text  = element_text(size = 9),
+        axis.text.x  = element_text(angle = 45, hjust = 1))
+scale_color_wrapped <- scale_color_discrete(labels = ~ wrap_legend(.x, 28))
+scale_fill_wrapped  <- scale_fill_discrete(labels  = ~ wrap_legend(.x, 28))
+
+
 
 
 ```
@@ -541,13 +548,14 @@ ggplot(grouped_data_for_shares,
 
 ```{r}
 
-sub_prep <- std_one %>%
-  mutate(prime_date = as.Date(prime_date),
-         year = year(prime_date))
 
-summary_data_all <- sub_prep %>%
+primary_prep <- primary %>%
+  mutate(prime_date = as.Date(prime_date),
+         year = lubridate::year(prime_date))
+
+summary_data_all <- primary_prep %>%
   group_by(year, naics6_title) %>%
-  summarise(num_contracts = n(),
+  summarise(num_contracts = dplyr::n(),
             avg_contract_value = mean(nom_g, na.rm = TRUE),
             total_contract_value = sum(nom_g, na.rm = TRUE),
             .groups = "drop")
@@ -566,6 +574,7 @@ ggplot(hhi_by_year, aes(x = year, y = HHI)) +
   theme_clean
 
 
+
 ```
 
 The HHI (Herfindahl-Hirschman Index) measures market concentration. HHI is the sum of each industry's % share\*100, squared, for each year. If all the shares are small, nearing perfect competition, then the HHI will be close to 0 because the squared shares are very small. If one firm has 100% share, 100\^2 will be 10,000, the max HHI value. Below 1,500 is considered not concentrated, while an HHI above 2500 is considered highly concentrated. We can see here that concentration has decreased since 2010, but largely has not been concentrated. This value only measures the concentration of industries within federal government contracts, it does not say anything about the firm composition within any given industry.
@@ -573,7 +582,7 @@ The HHI (Herfindahl-Hirschman Index) measures market concentration. HHI is the s
 
 ```{r}
 
-quarterly_series <- sub_prep %>%
+quarterly_series <- primary_prep %>%
   mutate(quarter = floor_date(prime_date, "quarter")) %>%
   group_by(quarter) %>%
   summarise(total_value = sum(nom_g, na.rm = TRUE), .groups = "drop")
@@ -587,10 +596,11 @@ ggplot(quarterly_series, aes(x = quarter, y = total_value)) +
   theme_clean
 
 
+
+
 ```
 
 ```{r}
-
 size_vs_count <- summary_data_all %>%
   group_by(naics6_title) %>%
   summarise(total_value = sum(total_contract_value, na.rm = TRUE),
@@ -823,9 +833,6 @@ contracts <- contracts %>%
       ),
     by = "obs_id"
   )
-
-
-
 
 
 ```

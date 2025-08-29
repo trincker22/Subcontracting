@@ -20,7 +20,7 @@ k <- 4
 if (!exists("subcontract")) subcontract <- readRDS("/mnt/data/subcontract.RDS")
 
 x <- subcontract$subaward_description %>% 
-   as.character()
+   as.character() 
 
 corp <- corpus(x, docnames = as.character(seq_along(x)))
 toks <- tokens(corp, remove_punct = TRUE, remove_numbers = TRUE, remove_symbols = TRUE) |>
