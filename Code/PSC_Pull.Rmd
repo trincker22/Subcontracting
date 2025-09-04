@@ -4,11 +4,8 @@ output: html_document
 date: "2025-09-04"
 ---
 
-This script adds the subcontractor name to each description, cuts the description to the most important 250 words, and then runs batched description through the classification API, pulling the top 5 categories for each desc + the model's % confidence. 
-
-
 ```{r setup, include=FALSE}
-
+library(data.table)
 library(digest)
 library(dplyr)
 library(fs)
@@ -22,89 +19,96 @@ library(stringdist)
 library(stringr)
 library(tibble)
 library(tidyr)
+library(tidytext)
 
 options(scipen = 999)
-
-
+stop_words <- tidytext::stop_words
+`%||%` <- function(a, b) { if (is.null(a) || (is.atomic(a) && length(a) == 1 && is.na(a))) b else a }
 
 ```
 
-# Cut Query to 250 Words
 
 ```{r}
 
 make_psc_query <- function(df,
                            subawardee_col = "subawardee_name",
-                           raw_desc_col  = "subaward_description",
-                           expanded_col  = NULL,
-                           max_chars     = 250) {
-  
-  desc_col <- if (!is.null(expanded_col) && expanded_col %in% names(df)) {
-    expanded_col
-  } else if ("desc_expanded" %in% names(df)) {
-    "desc_expanded"
-  } else {
-    raw_desc_col
-  }
-  
+                           raw_desc_col   = "subaward_description",
+                           expanded_col   = "expanded_description",
+                           max_chars      = 250) {
+
+  desc_col <- if (expanded_col %in% names(df)) expanded_col else raw_desc_col
+
   base <- df %>%
-    mutate(.doc_id = row_number(),
-           .subawardee = .data[[subawardee_col]] %>% as.character() %>% coalesce(""),
-           .desc = .data[[desc_col]] %>% as.character() %>% coalesce("")) %>%
+    mutate(
+      .doc_id     = row_number(),
+      .subawardee = coalesce(as.character(.data[[subawardee_col]]), ""),
+      .desc       = coalesce(as.character(.data[[desc_col]]), "")
+    ) %>%
     mutate(.desc = str_squish(.desc))
-  
-  # Break into sentences
+
   sent_df <- base %>%
     mutate(.sent_list = str_split(.desc, boundary("sentence"))) %>%
     select(.doc_id, .subawardee, .sent_list) %>%
     unnest_longer(.sent_list, values_to = ".sentence", keep_empty = TRUE) %>%
     mutate(.sentence = str_squish(.sentence))
-  
-  # Tokenize and compute tf-idf
+
   word_df <- sent_df %>%
     filter(nchar(.sentence) > 0) %>%
-    unnest_tokens(word, .sentence, token = "words", drop = FALSE) %>%
-    filter(!word %in% stop_words$word, !str_detect(word, "^[0-9]+$")) %>%
-    group_by(.doc_id, .sentence) %>%
-    dplyr::count(word, name = "term_n") %>%
-    ungroup() %>%
-    bind_tf_idf(word, .doc_id, term_n)
-  
-  # Sentence scores
+    tidytext::unnest_tokens(word, .sentence, token = "words", drop = FALSE) %>%
+    filter(!word %in% tidytext::stop_words$word, !str_detect(word, "^[0-9]+$"))
+
+  doc_term <- word_df %>%
+    count(.doc_id, word, name = "n") %>%
+    bind_tf_idf(word, .doc_id, n) %>%
+    select(.doc_id, word, tf_idf)
+
   sent_scores <- word_df %>%
+    left_join(doc_term, by = c(".doc_id","word")) %>%
     group_by(.doc_id, .sentence) %>%
     summarise(score = sum(tf_idf, na.rm = TRUE), .groups = "drop")
-  
-  # Pick top text per doc
+
   best_text <- sent_df %>%
     left_join(sent_scores, by = c(".doc_id", ".sentence")) %>%
     mutate(score = coalesce(score, 0)) %>%
     group_by(.doc_id) %>%
     arrange(desc(score), .sentence, .by_group = TRUE) %>%
-    summarise(.best = paste(.sentence[nchar(.sentence) > 0], collapse = " "),
-              .subawardee = first(.subawardee),
-              .groups = "drop") %>%
-    mutate(.best = ifelse(is.na(.best), "", str_squish(.best)))
-  
-  out <- best_text %>%
-    mutate(.prefix = ifelse(nchar(.subawardee) > 0, paste0(.subawardee, ": "), ""),
-           .room   = pmax(0, max_chars - nchar(.prefix)),
-           .body   = ifelse(nchar(.best) > 0, str_sub(.best, 1L, .room), ""),
-           psc_query_250 = str_squish(paste0(.prefix, .body))) %>%
+    summarise(
+      .sent_ranked = list(.sentence[nchar(.sentence) > 0]),
+      .subawardee  = first(.subawardee),
+      .groups = "drop"
+    ) %>%
+    rowwise() %>%
+    mutate(
+      .prefix = ifelse(nchar(.subawardee) > 0, paste0(.subawardee, ": "), ""),
+      .room   = max(0L, max_chars - nchar(.prefix)),
+      .best   = {
+        acc <- character(0); used <- 0L
+        for (s in .sent_ranked) {
+          s2  <- str_squish(s)
+          add <- ifelse(length(acc) > 0, 1L, 0L) + nchar(s2)
+          if (used + add > .room) break
+          acc  <- c(acc, s2)
+          used <- used + add
+        }
+        if (!length(acc) && length(.sent_ranked) > 0) substr(.sent_ranked[1], 1L, .room) else paste(acc, collapse = " ")
+      },
+      psc_query_250 = str_squish(substr(paste0(.prefix, .best), 1L, max_chars))
+    ) %>%
+    ungroup() %>%
     select(.doc_id, psc_query_250)
-  
-  # Fallback: truncate raw concat
+
   fallback <- base %>%
-    transmute(.doc_id,
-              fallback_text = str_squish(paste0(.subawardee,
-                                                ifelse(nchar(.subawardee) > 0, ": ", ""),
-                                                .desc)) %>% str_sub(1L, max_chars))
-  
-  final <- out %>%
+    mutate(
+      .pref         = ifelse(nchar(.subawardee) > 0, paste0(.subawardee, ": "), ""),
+      fallback_text = str_squish(substr(paste0(.pref, .desc), 1L, max_chars))
+    ) %>%
+    select(.doc_id, fallback_text)
+
+  final <- best_text %>%
     left_join(fallback, by = ".doc_id") %>%
-    mutate(psc_query_250 = ifelse(nchar(psc_query_250) == 0, fallback_text, psc_query_250)) %>%
+    mutate(psc_query_250 = ifelse(!nzchar(psc_query_250), fallback_text, psc_query_250)) %>%
     select(.doc_id, psc_query_250)
-  
+
   df %>%
     mutate(.doc_id = row_number()) %>%
     left_join(final, by = ".doc_id") %>%
@@ -112,28 +116,8 @@ make_psc_query <- function(df,
 }
 
 
-dat <- make_psc_query(subcontract,
-                      subawardee_col = "subawardee_name",
-                      raw_desc_col   = "subaward_description")
-head(dat$psc_query_250)
-
-
-vec <- dat %>% 
-    select(psc_query_250)
-
-```
-
-
-# Query with Batching
-
-```{r}
-
-
-`%||%` <- function(a, b) { if (is.null(a)) return(b); if (length(a)==0L) return(b); if (is.atomic(a) && length(a)==1L && is.na(a)) return(b); a }
-
 FSCPSC_API  <- "https://api.fscpsc.com/searches"
 FSCPSC_MIME <- "application/vnd.api+json"
-
 
 .rel_score_map_from_search <- function(jj, rel_key = "product-service-codes") {
   rel <- jj$data$relationships[[rel_key]]
@@ -141,7 +125,7 @@ FSCPSC_MIME <- "application/vnd.api+json"
   dat <- rel$data %||% list()
   if (!length(dat)) return(tibble(code=character(), score=double()))
   rows <- lapply(dat, function(x) {
-    meta <- x$meta %||% list()
+    meta  <- x$meta %||% list()
     assoc <- if (!is.null(meta$association)) suppressWarnings(as.numeric(meta$association)) else NA_real_
     tibble(code = toupper(as.character(x$id %||% "")), score = assoc)
   })
@@ -159,7 +143,7 @@ FSCPSC_MIME <- "application/vnd.api+json"
     if (!is.list(rel)) return(tibble(code=character(), score=double()))
     dat  <- rel$data %||% list()
     if (!length(dat)) return(tibble(code=character(), score=double()))
-    m <- dat[[1]]$meta %||% list()
+    m    <- dat[[1]]$meta %||% list()
     assoc <- if (!is.null(m$association)) suppressWarnings(as.numeric(m$association)) else NA_real_
     tibble(code = code, score = assoc)
   })
@@ -174,7 +158,10 @@ parse_fscpsc_jsonapi <- function(jj, want_type = "product-service-codes") {
     code <- toupper(as.character(x$id %||% x$attributes$id %||% ""))
     name <- as.character(x$attributes$name %||% x$attributes$title %||% x$attributes$`full-name` %||% NA_character_)
     tibble(code = code, name = name, type = want_type)
-  }) %>% bind_rows() %>% filter(nchar(code) == 4) %>% distinct(code, .keep_all = TRUE)
+  }) %>%
+    bind_rows() %>%
+    filter(nchar(code) == 4) %>%
+    distinct(code, .keep_all = TRUE)
 
   s1 <- .rel_score_map_from_search(jj, rel_key = want_type)
   s2 <- .rel_score_map_from_included(jj, want_type = want_type, back_rel = "searches")
@@ -183,7 +170,6 @@ parse_fscpsc_jsonapi <- function(jj, want_type = "product-service-codes") {
   rows %>% left_join(smap, by = "code") %>% arrange(desc(score), code)
 }
 
-# ---- single-call with retry, backoff, & 429 handling ----
 fscpsc_search_psc <- function(query, top_k = 5, timeout_sec = 25, max_retries = 4) {
   q <- as.character(query %||% "")
   if (!nzchar(q)) return(tibble(code=character(), name=character(), score=double(), rank=integer()))
@@ -193,51 +179,30 @@ fscpsc_search_psc <- function(query, top_k = 5, timeout_sec = 25, max_retries = 
     req <- request(FSCPSC_API) |>
       req_url_query(include = "product-service-codes") |>
       req_headers("Accept" = FSCPSC_MIME, "Content-Type" = FSCPSC_MIME) |>
-      req_body_json(list(data=list(type="searches", attributes=list(`search-string`=q))), auto_unbox=TRUE) |>
+      req_body_json(list(data = list(type = "searches", attributes = list(`search-string` = q))), auto_unbox = TRUE) |>
       req_timeout(timeout_sec)
+
     resp <- try(req_perform(req), silent = TRUE)
 
-    # success
-    if (inherits(resp,"httr2_response") && resp_status(resp) %in% c(200,201)) {
+    if (inherits(resp, "httr2_response") && resp_status(resp) %in% c(200, 201)) {
       jj  <- resp_body_json(resp, simplifyVector = FALSE)
       out <- parse_fscpsc_jsonapi(jj, want_type = "product-service-codes")
       if (nrow(out)) out <- out %>% mutate(rank = row_number()) %>% slice_head(n = top_k)
       return(out)
     }
 
-    # 429 rate limit: wait according to headers or exponential backoff
-    if (inherits(resp,"httr2_response") && resp_status(resp) == 429) {
+    if (inherits(resp, "httr2_response") && resp_status(resp) == 429) {
       reset <- as.numeric(resp_header(resp, "X-RateLimit-Reset") %||% NA_real_)
-      # if header exists and is reasonable, sleep that many seconds; else exponential backoff
-      wait_s <- if (is.finite(reset) && reset > 0 && reset < 60) reset else min(2^(attempt-1), 30)
+      wait_s <- if (is.finite(reset) && reset > 0 && reset < 60) reset else min(2^(attempt - 1), 30)
       Sys.sleep(wait_s + runif(1, 0, 0.5))
     } else {
-      # other errors: backoff and retry
       if (attempt >= max_retries) return(tibble(code=character(), name=character(), score=double(), rank=integer()))
-      Sys.sleep(min(2^(attempt-1), 8) + runif(1, 0, 0.2))
+      Sys.sleep(min(2^(attempt - 1), 8) + runif(1, 0, 0.2))
     }
   }
 }
 
-# Build a stable key for each row (hash of key columns, or fallback to row_number)
-make_psc_keys <- function(df, key_cols = NULL, query_col = NULL) {
-  if (is.null(query_col)) stop("Provide query_col (the 250-char string you send to the API).")
-  if (!query_col %in% names(df)) stop("query_col not found in df.")
-  if (is.null(key_cols)) {
-    df %>% mutate(.psc_key = sprintf("ROW%07d", dplyr::row_number()))
-  } else {
-    df %>% mutate(
-      .psc_key = digest::digest(do.call(paste, c(.[key_cols], sep="|")), algo = "xxhash64")
-    )
-  }
-}
-
-
-
-
-make_run_paths <- function(base_dir = "psc_api_runs",
-                           dataset_tag = "default",
-                           create = TRUE) {
+make_run_paths <- function(base_dir = "psc_api_runs", dataset_tag = "default", create = TRUE) {
   base_dir <- fs::path_abs(base_dir)
   cache_dir <- fs::path(base_dir, "cache")
   out_dir   <- fs::path(base_dir, "outputs")
@@ -252,63 +217,69 @@ make_run_paths <- function(base_dir = "psc_api_runs",
   )
 }
 
-# atomic writers
-safe_write_rds <- function(obj, path) {
-  tmp <- paste0(path, ".tmp_", sprintf("%06d", sample.int(1e6,1)))
-  saveRDS(obj, tmp); fs::file_move(tmp, path)
+safe_write_rds <- function(obj, path) { tmp <- paste0(path, ".tmp_", sprintf("%06d", sample.int(1e6,1))); saveRDS(obj, tmp); fs::file_move(tmp, path) }
+safe_write_csv <- function(df, path)  { tmp <- paste0(path, ".tmp_", sprintf("%06d", sample.int(1e6,1))); readr::write_csv(df, tmp); fs::file_move(tmp, path) }
+
+key_cols <- c("prime_id","sub_id","subaward_number")
+
+diag_keys <- function(df) {
+  tibble(
+    n = nrow(df),
+    distinct_keys = dplyr::n_distinct(df$.psc_key %||% character())
+  )
 }
-safe_write_csv <- function(df, path) {
-  tmp <- paste0(path, ".tmp_", sprintf("%06d", sample.int(1e6,1)))
-  readr::write_csv(df, tmp); fs::file_move(tmp, path)
-}
 
-
-
-# Ensure a directory exists
-ensure_dir <- function(path) { if (!fs::dir_exists(path)) fs::dir_create(path, recurse = TRUE); path }
-
-
-# permanent row keys 
 make_psc_keys <- function(df, key_cols = NULL, query_col) {
   stopifnot(query_col %in% names(df))
-  if (is.null(key_cols)) {
-    df %>% mutate(.psc_key = sprintf("ROW%07d", dplyr::row_number()))
-  } else {
-    df %>%
-      mutate(.psc_key = digest::digest(do.call(paste, c(.[key_cols], sep = "|")), algo = "xxhash64"))
+  if (is.null(key_cols)) key_cols <- character(0)
+
+  df1 <- df %>%
+    mutate(
+      across(all_of(key_cols), ~ coalesce(as.character(.), "")),
+      .q = str_squish(coalesce(as.character(.data[[query_col]]), "")),
+      .id_combo = if (length(key_cols)) do.call(paste, c(.[key_cols], sep="|")) else "",
+      .all_empty = (.id_combo == paste(rep("", length(key_cols)), collapse="|"))
+    ) %>%
+    mutate(
+      .salt = ifelse(.all_empty, paste0("Q|", .q), paste0("ID|", .id_combo)),
+      .psc_key = vapply(.salt, digest::digest, character(1), algo = "xxhash64")
+    )
+
+  if (dplyr::n_distinct(df1$.psc_key) < nrow(df1)) {
+    df1 <- df1 %>%
+      mutate(.psc_key = vapply(paste0(.salt, "#", row_number()), digest::digest, character(1), algo = "xxhash64"))
   }
+
+  df1 %>% select(-.q, -.id_combo, -.all_empty, -.salt)
 }
+
 
 run_fscpsc_psc <- function(df,
                            query_col     = "psc_query_250",
                            key_cols      = NULL,
-                           paths         = make_run_paths("psc_api_runs", "default"),
+                           paths         = make_run_paths(here::here("runs","psc"), "default"),
                            snapshot_csv  = TRUE,
                            top_k         = 5,
-                           batch_size    = 80,      # < 100 req/min
-                           pause_between = 1.0,     # seconds between batches
-                           per_call_sleep= 0.25     # seconds between calls
-                           ) {
+                           batch_size    = 60,
+                           pause_between = 2.0,
+                           per_call_sleep= 0.8) {
 
-  # prepare keys + query col
   keyed <- make_psc_keys(df, key_cols = key_cols, query_col = query_col) %>%
     transmute(.psc_key, !!query_col := .data[[query_col]])
 
-  # load or init cache (unique by query string)
-  cache <- if (fs::file_exists(paths$cache_rds)) readRDS(paths$cache_rds)
-           else tibble(psc_query_250 = character(), .pred = list())
-  if (!all(c("psc_query_250",".pred") %in% names(cache))) {
-    cache <- tibble(psc_query_250 = character(), .pred = list())
-  }
+  cache <- if (fs::file_exists(paths$cache_rds)) readRDS(paths$cache_rds) else tibble(psc_query_250 = character(), .pred = list())
+  if (!all(c("psc_query_250", ".pred") %in% names(cache))) cache <- tibble(psc_query_250 = character(), .pred = list())
 
-  # find new queries
-  unique_queries <- keyed %>% distinct(.data[[query_col]])
-  need <- unique_queries %>% anti_join(cache, by = setNames("psc_query_250", query_col))
+  unique_queries <- keyed %>%
+    distinct(.data[[query_col]]) %>%
+    rename(psc_query_250 = !!query_col) %>%
+    filter(!is.na(psc_query_250), nzchar(psc_query_250))
+
+  need <- unique_queries %>% anti_join(cache, by = "psc_query_250")
   message(sprintf("Unique queries: %d | new: %d", nrow(unique_queries), nrow(need)))
 
-  # fetch in batches
   if (nrow(need) > 0) {
-    qvec <- need[[query_col]]
+    qvec <- need$psc_query_250
     batches <- split(qvec, ceiling(seq_along(qvec)/batch_size))
     for (bi in seq_along(batches)) {
       batch <- batches[[bi]]
@@ -316,13 +287,11 @@ run_fscpsc_psc <- function(df,
       batch_rows <- vector("list", length(batch))
       for (i in seq_along(batch)) {
         q <- as.character(batch[[i]])
-        preds <- fscpsc_search_psc(q, top_k = top_k)   # your API call + parser
+        preds <- fscpsc_search_psc(q, top_k = top_k)
         if (per_call_sleep > 0) Sys.sleep(per_call_sleep)
         batch_rows[[i]] <- tibble(psc_query_250 = q, .pred = list(preds))
       }
-      # update cache + checkpoint
-      cache <- bind_rows(cache, bind_rows(batch_rows)) %>%
-        distinct(psc_query_250, .keep_all = TRUE)
+      cache <- bind_rows(cache, bind_rows(batch_rows)) %>% distinct(psc_query_250, .keep_all = TRUE)
       safe_write_rds(cache, paths$cache_rds)
       message(sprintf("  cache saved → %s (n=%d)", paths$cache_rds, nrow(cache)))
       if (pause_between > 0 && bi < length(batches)) Sys.sleep(pause_between)
@@ -331,15 +300,13 @@ run_fscpsc_psc <- function(df,
     message("No new queries; using existing cache.")
   }
 
-  # expand top-k predictions and attach permanent keys
   preds_long <- keyed %>%
-    left_join(cache, by = setNames("psc_query_250", query_col)) %>%
+    rename(psc_query_250 = !!query_col) %>%
+    left_join(cache, by = "psc_query_250") %>%
     unnest(.pred, keep_empty = TRUE) %>%
-    transmute(.psc_key,
-              !!query_col := .data[[query_col]],
+    transmute(.psc_key, psc_query_250,
               code = .data$code, name = .data$name, score = .data$score, rank = .data$rank)
 
-  # save outputs
   safe_write_rds(preds_long, paths$preds_rds)
   message(sprintf("preds saved → %s  (rows=%d)", paths$preds_rds, nrow(preds_long)))
 
@@ -349,7 +316,6 @@ run_fscpsc_psc <- function(df,
     message(sprintf("snapshot csv → %s", snap))
   }
 
-  # top-1 per row for easy join-back
   top1 <- preds_long %>%
     group_by(.psc_key) %>%
     arrange(rank, .by_group = TRUE) %>%
@@ -365,40 +331,69 @@ run_fscpsc_psc <- function(df,
 
 
 ```
+```
 
-
-# Run 
 
 ```{r}
 
 
-build_psc_query <- function(df, vendor_col = "subawardee_name", desc_col = "subaward_description") {
-  df %>% mutate(psc_query_250 = str_sub(str_squish(paste0(.data[[vendor_col]], ": ", .data[[desc_col]])), 1L, 250))
-}
-sub_q <- subcontract %>% build_psc_query()
+# Input: subcontracts with acronym expansion completed 
 
-
-paths <- make_run_paths(
-  base_dir = here::here("runs","psc"),   
-  dataset_tag = "subset400",            
-  create = TRUE
+# 1) Build queries
+sub_q <- make_psc_query(
+  subcontracts,
+  subawardee_col = "subawardee_name",
+  raw_desc_col   = "subaward_description",
+  expanded_col   = "expanded_description",
+  max_chars      = 250
 )
 
-# run the batcher
+# 2) Stable per-row keys
+key_cols <- c("prime_id","sub_id","subaward_number")
+sub_keys <- make_psc_keys(sub_q, key_cols = key_cols, query_col = "psc_query_250")
+
+# 3) Run / reuse cache
+paths <- make_run_paths(here::here("runs","psc"), dataset_tag = "subset400", create = TRUE)
 res <- run_fscpsc_psc(
-  df            = sub_q,
+  df            = sub_keys,
   query_col     = "psc_query_250",
-  key_cols      = c("prime_id", "sub_id", "subaward_number"),
+  key_cols      = key_cols,
   paths         = paths,
   top_k         = 5,
-  batch_size    = 80,
-  pause_between = 1.0,
-  per_call_sleep= 0.25
+  batch_size    = 60,
+  pause_between = 2.0,
+  per_call_sleep= 0.8
 )
 
-# join with permanent key
-sub_with_keys <- make_psc_keys(sub_q, key_cols = c("prime_id","sub_id","subaward_number"), query_col = "psc_query_250")
-sub_with_api  <- sub_with_keys %>% left_join(res$top1, by = ".psc_key")
+# 4) Top-1 on original rows
+sub_with_top1 <- sub_keys %>% left_join(res$top1, by = ".psc_key")
+
+# 5) Full top-k (long)
+preds_topk_long <- res$preds_topk %>%
+  rename(psc_code = code, psc_name = name, psc_score = score)
+
+
+sub_with_topk_nested <- sub_keys %>%
+  left_join(
+    preds_topk_long %>%
+      group_by(.psc_key) %>%
+      arrange(rank, .by_group = TRUE) %>%
+      summarise(psc_topk = list(tibble(rank, psc_code, psc_name, psc_score)), .groups = "drop"),
+    by = ".psc_key"
+  )
+
+# 7) Save outputs
+safe_write_rds(sub_with_top1,         here::here("runs","psc","outputs","sub_with_top1_subset400.rds"))
+safe_write_rds(preds_topk_long,       here::here("runs","psc","outputs","preds_topk_long_subset400.rds"))
+safe_write_rds(sub_with_topk_nested,  here::here("runs","psc","outputs","sub_with_topk_nested_subset400.rds"))
 
 
 ```
+
+
+```{r}
+
+
+
+```
+
