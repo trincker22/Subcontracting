@@ -1,11 +1,13 @@
 ---
-title: "MakeReadable"
+title: "PSC_Pull"
 output: html_document
-date: "2025-08-27"
+date: "2025-09-04"
 ---
 
-```{r}
+This script adds the subcontractor name to each description, cuts the description to the most important 250 words, and then runs batched description through the classification API, pulling the top 5 categories for each desc + the model's % confidence. 
 
+
+```{r setup, include=FALSE}
 
 library(digest)
 library(dplyr)
@@ -23,399 +25,13 @@ library(tidyr)
 
 options(scipen = 999)
 
-```
-
-DAU Dictionary
-
-```{r}
-
-dict_path <- here("Data", "acronymdict.RDS")
-xlsx_path <- here("Data", "acronymdict.xlsx")
-
-if (!file.exists(dict_path)) {
-  raw <- read_xlsx(xlsx_path, col_names = FALSE)
-  colname <- names(raw)[which.max(colSums(!is.na(raw)))]
-  lines <- raw[[colname]] |> as.character() |> str_squish()
-  lines <- lines[!is.na(lines) & nzchar(lines)]
-
-  split_acr <- function(txt) {
-    m <- regexec("^(\\S{2,15})\\s+(.+)$", txt); r <- regmatches(txt, m)[[1]]
-    if (length(r) == 3) data.frame(acr = toupper(trimws(r[2])), exp = trimws(r[3])) 
-    else data.frame(acr = NA, exp = NA)
-  }
-
-  acr_dict_dau <- bind_rows(lapply(lines, split_acr)) |>
-    filter(!is.na(acr), !is.na(exp), nzchar(acr), nzchar(exp)) |>
-    mutate(exp = str_split(exp, ";")) |>
-    unnest(exp) |>
-    mutate(exp = str_squish(exp)) |>
-    filter(exp != "") |>
-    distinct(acr, exp)
-
-  saveRDS(acr_dict_dau, dict_path)
-} else {
-  acr_dict_dau <- readRDS(dict_path)
-}
-
-```
- 
-Mined Dictionary
-
-```{r}
-
-texts <- subcontract$subaward_description
-
-# ---- Builder functions ----
-catalog_markers <- c("PN","NSN","CLIN","NIIN","SDRL","FAI","MTBF","BOM","EOL","CAGE","P/N","S/N")
-connectors <- c("AND","OF","THE","FOR","IN","ON","WITH","TO","BY","AT","FROM","A","AN")
-JW_THRESH <- 0.93
-
-looks_like_acronym <- function(acr) {
-  acr <- toupper(as.character(acr))
-  ok_shape       <- grepl("^[A-Z0-9][A-Z0-9&\\.\\-]{1,9}$", acr)
-  enough_letters <- stringr::str_count(acr, "[A-Z]") >= 2
-  ok <- ok_shape & enough_letters
-  ok[is.na(ok)] <- FALSE
-  ok
-}
-
-normalize_phrase <- function(x) {
-  x %>%
-    toupper() %>%
-    str_replace_all("&", " AND ") %>%
-    str_replace_all("[ ]*/[ ]*", "/") %>%
-    str_replace_all("[^A-Z0-9/ \\-]", " ") %>%
-    str_replace_all("\\s+", " ") %>%
-    str_squish()
-}
-
-initials_from_phrase_vec <- function(phr, drop_words = connectors) {
-  p <- normalize_phrase(phr)
-  toks <- str_split(p, "\\s+")
-  n <- length(toks)
-  out_init <- character(n); out_ntok <- integer(n)
-  for (i in seq_len(n)) {
-    ti <- toks[[i]]
-    ti <- ti[!(ti %in% drop_words)]
-    ti <- ti[nzchar(ti)]
-    out_ntok[i] <- length(ti)
-    out_init[i] <- if (length(ti)) paste0(substr(ti, 1, 1), collapse = "") else ""
-  }
-  list(init = out_init, n_tokens = out_ntok)
-}
-
-strip_leading_connectors <- function(x) {
-  x %>% toupper() %>% str_squish() %>% str_replace("^(?:AND THE|AND|OR|THE)\\s+", "")
-}
-
-normalize_exp_display <- function(x) {
-  x %>%
-    toupper() %>%
-    str_replace_all("[ ]*/[ ]*", " / ") %>%
-    str_replace_all("[ ]*-[ ]*", "-") %>%
-    str_replace_all("\\s+", " ") %>%
-    str_squish()
-}
-
-
-pat_exp_acr <- "(?<exp>[A-Za-z][A-Za-z0-9/&\\-\\. ,]+?)\\s*\\((?<acr>[A-Z0-9][A-Z0-9&\\.\\-]{1,9})\\)"
-pat_acr_exp <- "(?<acr>[A-Z0-9][A-Z0-9&\\.\\-]{1,9})\\s*\\((?<exp>[A-Za-z][A-Za-z0-9/&\\-\\. ,]+?)\\)"
-
-extract_pairs_one <- function(txt, doc_id) {
-  m1 <- str_match_all(txt, pat_exp_acr)[[1]]
-  df1 <- if (nrow(m1)) tibble(acr = m1[, "acr"], exp = m1[, "exp"], pattern = "longform_paren", doc_id = doc_id) else tibble(acr=character(),exp=character(),pattern=character(),doc_id=integer())
-  m2 <- str_match_all(txt, pat_acr_exp)[[1]]
-  df2 <- if (nrow(m2)) tibble(acr = m2[, "acr"], exp = m2[, "exp"], pattern = "acr_paren_longform", doc_id = doc_id) else tibble(acr=character(),exp=character(),pattern=character(),doc_id=integer())
-  bind_rows(df1, df2)
-}
-
-mine_acronym_pairs <- function(texts) {
-  cand <- map2_dfr(texts, seq_along(texts), extract_pairs_one) %>%
-    mutate(acr = toupper(str_squish(acr)),
-           exp = str_squish(exp)) %>%
-    filter(nchar(acr) >= 2, nchar(exp) >= 3, !acr %in% catalog_markers)
-
-  if (nrow(cand) == 0) return(cand)
-
-  iv <- initials_from_phrase_vec(cand$exp)
-  cand$init     <- iv$init
-  cand$n_tokens <- iv$n_tokens
-
-  cand %>%
-    filter(
-      looks_like_acronym(acr),
-      n_tokens >= nchar(acr),
-      init == acr
-    ) %>%
-    distinct(acr, exp, doc_id, pattern)
-}
-
-# Aggregating collapse
-collapse_within_acr_jw_agg <- function(df, jw_thresh = JW_THRESH) {
-  if (!nrow(df)) return(list(
-    dict = tibble(acr=character(), exp_uc=character(), freq=integer()),
-    map  = tibble(acr=character(), exp_uc_raw=character(), exp_uc_canon=character())
-  ))
-  df2 <- df %>%
-    mutate(
-      exp    = strip_leading_connectors(as.character(exp)),
-      exp    = normalize_exp_display(exp),
-      exp_uc = toupper(exp),
-      freq   = coalesce(as.integer(freq), 1L)
-    ) %>%
-    filter(nzchar(exp_uc)) %>%
-    arrange(desc(freq), desc(nchar(exp_uc))) %>%
-    distinct(exp_uc, .keep_all = TRUE)
-
-  n <- nrow(df2); if (n <= 1) return(list(
-    dict = tibble(acr=df2$acr, exp_uc=df2$exp_uc, freq=df2$freq),
-    map  = tibble(acr=df2$acr, exp_uc_raw=df2$exp_uc, exp_uc_canon=df2$exp_uc)
-  ))
-
-  S <- 1 - stringdistmatrix(df2$exp_uc, df2$exp_uc, method="jw"); diag(S) <- 1
-  comp <- rep(NA_integer_, n); cid <- 0L
-  for (i in seq_len(n)) if (is.na(comp[i])) {
-    cid <- cid + 1L; q <- i; comp[i] <- cid
-    while (length(q)) {
-      v <- q[1]; q <- q[-1]
-      neigh <- which(S[v, ] >= jw_thresh & is.na(comp))
-      if (length(neigh)) { comp[neigh] <- cid; q <- c(q, neigh) }
-    }
-  }
-  clusters <- split(seq_len(n), comp)
-
-  dict <- map_dfr(clusters, function(ix){
-    pick <- ix[order(-df2$freq[ix], -nchar(df2$exp_uc[ix]))][1]
-    tibble(acr=df2$acr[pick], exp_uc=df2$exp_uc[pick], freq=sum(df2$freq[ix]))
-  })
-  map <- map_dfr(clusters, function(ix){
-    pick <- ix[order(-df2$freq[ix], -nchar(df2$exp_uc[ix]))][1]
-    tibble(acr=df2$acr[ix], exp_uc_raw=df2$exp_uc[ix], exp_uc_canon=df2$exp_uc[pick])
-  })
-  list(dict=dict, map=map)
-}
-
-
-
-
-# Run mining 
-hi_conf_pairs <- mine_acronym_pairs(texts)
-
-dict_all_raw <- hi_conf_pairs %>%
-  mutate(exp = normalize_exp_display(exp)) %>%
-  dplyr::count(acr, exp, name = "freq", sort = TRUE)
-
-# Collapse within acronym, aggregating counts + create raw->canonical map
-by_acr <- split(dict_all_raw, dict_all_raw$acr)
-res    <- map(by_acr, ~ collapse_within_acr_jw_agg(.x, jw_thresh = JW_THRESH))
-dict_all <- bind_rows(map(res, "dict"))    # (acr, exp_uc, freq) canonical with SUMMED freq
-exp_map  <- bind_rows(map(res, "map"))     # (acr, exp_uc_raw -> exp_uc_canon)
-
-# Canonical pair features from mined pairs (doc coverage + definitional hits)
-feat_tbl <- hi_conf_pairs %>%
-  mutate(exp_uc_raw = toupper(normalize_exp_display(exp))) %>%
-  left_join(exp_map, by = c("acr","exp_uc_raw")) %>%
-  mutate(exp_uc = coalesce(exp_uc_canon, exp_uc_raw)) %>%
-  distinct(acr, exp_uc, doc_id, pattern) %>%
-  group_by(acr, exp_uc) %>%
-  summarise(
-    doc_coverage = n_distinct(doc_id),
-    def_hits     = sum(!is.na(pattern) & pattern %in% c("longform_paren","acr_paren_longform")),
-    .groups = "drop"
-  )
-
-```
-
-Merge
-
-```{r}
-
-
-ACRONYM_KEEP <- c("DoD","USAF","USN","USMC","USA","AFOTEC","JSF","COTS","F-35","MTBF","BOM",
-                  "SDRL","NSN","CLIN","NIIN","CAGE","ISR","GPS","RF","IT","AI","UAS","UAV","SATCOM")
-SMALL_WORDS <- c("and","or","of","the","for","in","on","with","to","by","at","from","a","an")
-
-normalize_spaces <- function(x) { x %>% str_replace_all("\\s+", " ") %>% str_squish() }
-title_token <- function(tok) {
-  if (tok %in% ACRONYM_KEEP) return(tok)
-  if (grepl("\\d", tok)) return(toupper(tok))
-  if (nchar(tok) <= 4 && grepl("^[A-Z]+$", tok)) return(tok)
-  split_and_cap <- function(s, sep) {
-    parts <- strsplit(s, sep, fixed = TRUE)[[1]]
-    parts <- ifelse(nchar(parts),
-                    paste0(str_to_upper(substr(parts,1,1)), str_to_lower(substr(parts,2,nchar(parts)))),
-                    parts)
-    paste(parts, collapse = sep)
-  }
-  tok <- split_and_cap(tok, "-"); tok <- split_and_cap(tok, "/"); tok
-}
-pretty_case <- function(x) {
-  if (is.na(x) || !nzchar(x)) return(x)
-  x0 <- normalize_spaces(x); toks <- strsplit(x0, " +")[[1]]
-  if (!length(toks)) return(x0)
-  out <- character(length(toks))
-  for (i in seq_along(toks)) {
-    b <- toks[i]
-    if (tolower(b) %in% SMALL_WORDS && i != 1 && i != length(toks)) out[i] <- tolower(b) else out[i] <- title_token(b)
-  }
-  out <- ifelse(toupper(out) %in% toupper(ACRONYM_KEEP),
-                ACRONYM_KEEP[match(toupper(out), toupper(ACRONYM_KEEP))],
-                out)
-  paste(out, collapse = " ")
-}
-pretty_case_vec <- function(x) vapply(x, pretty_case, character(1))
-
-
-acr_mined_all <- dict_all %>%
-  mutate(
-    exp_disp = pretty_case_vec(exp_uc),
-    source   = "mined"
-  ) %>%
-  left_join(feat_tbl, by = c("acr","exp_uc")) %>%
-  mutate(
-    freq         = coalesce(freq, 0L),   # canonical pair frequency across corpus
-    doc_coverage = coalesce(doc_coverage, 0L),
-    def_hits     = coalesce(def_hits, 0L)
-  )
-
-
-if (exists("acr_dict_dau")) {
-  acr_dau_enriched <- acr_dict_dau %>%
-    mutate(
-      acr      = toupper(str_squish(acr)),
-      exp_uc   = toupper(normalize_exp_display(exp)),
-      exp_disp = pretty_case_vec(exp),
-      source   = "DAU"
-    ) %>%
-    filter(nzchar(acr), nzchar(exp_uc)) %>%
-    distinct(acr, exp_uc, .keep_all = TRUE) %>%
-    left_join(select(dict_all, acr, exp_uc, freq), by = c("acr","exp_uc")) %>%     # canonical pair freq
-    left_join(feat_tbl, by = c("acr","exp_uc")) %>%                                # canonical features
-    mutate(
-      freq         = coalesce(freq, 0L),
-      doc_coverage = coalesce(doc_coverage, 0L),
-      def_hits     = coalesce(def_hits, 0L)
-    )
-
-  acr_all_sources <- bind_rows(acr_mined_all, acr_dau_enriched) %>%
-    distinct(acr, exp_uc, .keep_all = TRUE)
-} else {
-  acr_all_sources <- acr_mined_all
-}
-
-# Combined dictionary (for meta)
-dict_mined <- dict_all %>% select(acr, exp_uc) %>% distinct()
-dict_dau <- if (exists("acr_dict_dau")) {
-  acr_dict_dau %>%
-    mutate(acr = toupper(str_squish(acr)),
-           exp_uc = toupper(normalize_exp_display(exp))) %>%
-    filter(nzchar(acr), nzchar(exp_uc)) %>%
-    distinct(acr, exp_uc)
-} else tibble(acr = character(), exp_uc = character())
-dict_union <- bind_rows(dict_mined, dict_dau) %>% distinct(acr, exp_uc)
-
 
 
 ```
 
-Scoring
+# Cut Query to 250 Words
 
 ```{r}
-
-
-w_def <- 2.5; w_freq <- 1.0; w_doc <- 0.8; w_auth <- 1.2
-acr_candidates <- acr_all_sources %>%
-  mutate(auth_hits = if_else(source == "DAU", 1L, 0L)) %>%
-  group_by(acr) %>%
-  mutate(
-    score_raw = w_def*def_hits + w_freq*log1p(freq) + w_doc*log1p(doc_coverage) + w_auth*auth_hits,
-    score     = (score_raw - min(score_raw, na.rm = TRUE)) /
-                (max(score_raw, na.rm = TRUE) - min(score_raw, na.rm = TRUE) + 1e-9)
-  ) %>%
-  arrange(desc(score), .by_group = TRUE) %>%
-  mutate(rank = row_number()) %>%
-  ungroup()
-
-margin <- 0.15
-acr_lexicon <- acr_candidates %>%
-  group_by(acr) %>%
-  summarise(
-    best        = first(exp_disp),
-    best_uc     = first(exp_uc),
-    confidence  = first(score),
-    alt         = if (n() >= 2) nth(exp_disp, 2) else NA_character_,
-    alt_score   = if (n() >= 2) nth(score, 2) else NA_real_,
-    keep_top2   = !is.na(alt_score) & (confidence - alt_score) < margin,
-    .groups = "drop"
-  )
-
-# META VARS
-
-# (1) # unique canonical expansions per acronym in combined dictionary (dictionary-only)
-acr_dict_freq <- dict_union %>% dplyr::count(acr, name = "acr_dict_freq")
-
-# (2) & (3) corpus counts per acronym
-texts_upper <- toupper(texts)
-regex_escape <- function(x) gsub("([\\^$.|?*+(){}\\[\\]\\\\])", "\\\\\\1", x)
-make_pat <- function(acr) paste0("(?<![A-Z0-9])", regex_escape(acr), "(?![A-Z0-9])")
-
-acrs <- sort(unique(dict_union$acr))
-counts <- lapply(acrs, function(a){
-  pat  <- make_pat(a)
-  occ  <- sum(str_count(texts_upper, pat))   # total occurrences in corpus
-  docs <- sum(str_detect(texts_upper, pat))  # # of docs containing it
-  c(acr = a, acr_corpus_freq = occ, doc_cov_acr = docs)
-})
-acr_counts <- as_tibble(do.call(rbind, counts)) %>%
-  mutate(acr_corpus_freq = as.integer(acr_corpus_freq),
-         doc_cov_acr     = as.integer(doc_cov_acr))
-
-acr_meta <- acr_dict_freq %>%
-  full_join(acr_counts, by = "acr") %>%
-  mutate(
-    acr_dict_freq   = coalesce(acr_dict_freq, 0L),
-    acr_corpus_freq = coalesce(acr_corpus_freq, 0L),
-    doc_cov_acr     = coalesce(doc_cov_acr, 0L)
-  )
-
-# Attach meta to pair-level dictionary and 1-per-acr lexicon
-acr_all_sources <- acr_all_sources %>% left_join(acr_meta, by = "acr")
-acr_lexicon     <- acr_lexicon     %>% left_join(acr_meta, by = "acr")
-
-
-
-
-# EXPANDER
-
-expand_with_lexicon <- function(text, lex, tau = 0.4){
-  if (!nrow(lex)) return(text)
-  vapply(text, function(t){
-    parts <- strsplit(t, "\\b")[[1]]
-    for (i in seq_along(parts)){
-      w <- parts[i]
-      if (grepl("^[A-Z]{2,10}$", w) && !grepl("^\\d+$", w)){
-        j <- match(w, lex$acr)
-        if (!is.na(j) && is.finite(lex$confidence[j]) && lex$confidence[j] >= tau){
-          parts[i] <- paste0(lex$best[j], " (", w, ")")
-        }
-      }
-    }
-    paste(parts, collapse = "")
-  }, character(1))
-}
-
-
-texts_expanded <- expand_with_lexicon(texts, acr_lexicon, tau = 0.4)
-
-
-glimpse(subcontract)
-```
-
-
-
-
-```{r}
-
 
 make_psc_query <- function(df,
                            subawardee_col = "subawardee_name",
@@ -508,7 +124,7 @@ vec <- dat %>%
 ```
 
 
-API Queries
+# Query with Batching
 
 ```{r}
 
@@ -750,7 +366,9 @@ run_fscpsc_psc <- function(df,
 
 ```
 
-to run 
+
+# Run 
+
 ```{r}
 
 
@@ -784,5 +402,3 @@ sub_with_api  <- sub_with_keys %>% left_join(res$top1, by = ".psc_key")
 
 
 ```
-
-
