@@ -1,0 +1,93 @@
+---
+title: "UEI"
+output: html_document
+date: "2025-09-09"
+---
+
+```{r}
+library(readr)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(here)
+library(readr)
+library(stringr)
+library(dplyr)
+library(readxl)
+library(lubridate)
+library(purrr)
+
+
+
+dir_in <- here("Data", "SAM_ER", "Input")
+map_xlsx <- here("Data", "SAM_ER", "SAM_MAP.xlsx")
+
+
+map <- read_excel(map_xlsx, sheet = "Data Element Mapping", skip = 3, col_types = "text")
+hdr_public <- map |>
+  filter(Public == "X") |>
+  mutate(`Column Order` = suppressWarnings(as.numeric(`Column Order`))) |>
+  filter(!is.na(`Column Order`)) |>
+  arrange(`Column Order`) |>
+  pull(`SAM Data Element List`)
+
+parse_sam_public_dat <- function(file, headers = hdr_public) {
+  con <- file(file, open = "r", encoding = "UTF-8")
+  on.exit(close(con))
+  out <- vector("list", 0L); i <- 0L
+  repeat {
+    lines <- readLines(con, n = 100000L, warn = FALSE)
+    if (!length(lines)) break
+    lines <- trimws(lines)
+    lines <- lines[nzchar(lines)]
+    lines <- lines[!grepl("^(BOF|EOF)\\s", lines)]
+    lines <- sub("!end\\s*$", "", lines, perl = TRUE)
+    if (!length(lines)) next
+    pieces <- strsplit(lines, "|", fixed = TRUE)
+    mats <- lapply(pieces, function(x) {
+      length(x) <- length(headers)
+      x
+    })
+    m <- do.call(rbind, mats)
+    df <- as.data.frame(m, stringsAsFactors = FALSE)
+    names(df) <- headers
+    df[df == ""] <- NA_character_
+    i <- i + 1L
+    out[[i]] <- df
+  }
+  bind_rows(out)
+}
+
+
+files <- list.files(dir_in, pattern = "\\.dat$", full.names = TRUE)
+all_df <- map_dfr(files, ~parse_sam_public_dat(.x), .id = "source_file")
+
+
+date_cols <- intersect(
+  c("INITIAL REGISTRATION DATE","REGISTRATION EXPIRATION DATE",
+    "LAST UPDATE DATE","ACTIVATION DATE","ENTITY START DATE"),
+  names(all_df)
+)
+all_df[date_cols] <- lapply(all_df[date_cols], ~ suppressWarnings(ymd(.x)))
+
+
+
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+

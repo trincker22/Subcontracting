@@ -309,8 +309,6 @@ if (file.exists(cache_primary_path) & !force_recompute) {
   }
 }
 
-naics_key6 <- primary %>% distinct(naics_2022, naics6_title)
-
 # ----------------------------
 # priors / audit if run_priors=T
 # ----------------------------
