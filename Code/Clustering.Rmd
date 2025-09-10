@@ -14,9 +14,10 @@ library(magrittr)
 library(Matrix)
 library(irlba)
 library(hunspell)
+library(haven)
 
 
-subcontracts <- readRDS("~/Downloads/subcontracts.RDS")
+subcontracts <- read_dta("M:/Xiaoqing/Subcontracting/forNLP_2.dta")
 x_raw <- subcontracts$subaward_description
 x_raw[is.na(x_raw)] <- ""
 
@@ -77,6 +78,8 @@ Next, I compute TF-IDF weights on the sparse DFM. TF-IDF scales each token by it
 ![](images/clipboard-3058053400.png){width="492"}
 
 I run k means clustering to find document clusters. The idea is that we randomly initialize k (\<n) cluster centers in the feature space. Think about each document as a vector whose components are given by the token frequency values from the document term matrix. So, we assign every document to the nearest cluster center (or centroid) by minimizing the squared Euclidean distance. Then, after all documents have been assigned a cluster, the new cluster centers will be recomputed as the average of the points assigned to it, and the process repeats until the changes in new cluster centers are very small. So in this clustering method we find 1. the local optimum, which may or may not be globlal, this is dependent on our randomly initialized values and 2. documents are assigned to mutually exclusive groups, but the tokens emblematic of those groups could be shared. For ex., groups 1 and 2 may both very commonly have the word "assembly" and are distinguished by other tokens.
+
+Changing the K parameter will allow you to change the number of clusters. 
 
 ```{r, warning = F}
 
