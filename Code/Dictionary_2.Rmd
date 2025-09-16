@@ -1,0 +1,844 @@
+---
+title: "Dictionary_2"
+output: html_document
+date: "2025-09-15"
+---
+
+```{r}
+
+  library(digest)
+  library(dplyr)
+  library(readr)
+  library(here)
+  library(stringr)
+  library(stringi)
+  library(purrr)
+  library(tibble)
+  library(tidyr)
+  library(stringdist)
+  library(quanteda)
+  library(quanteda.textmodels)
+  library(parallel)
+  library(wordvector)
+  library(fs)
+
+
+here_path <- function(...) file.path(getwd(), ...)
+proc_dir <- here_path("Data","processed")
+if (!dir_exists(proc_dir)) dir_create(proc_dir, recurse = TRUE)
+
+subcontracts <- subcontracts[1:200000,]
+
+```
+
+
+
+```{r}
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+.safe_apply <- function(X, FUN, workers = 6) {
+  workers <- as.integer(max(1L, workers))
+  if (.Platform$OS.type == "windows" || workers == 1L) {
+    return(lapply(X, FUN))
+  }
+  ok <- TRUE
+  out <- tryCatch(parallel::mclapply(X, FUN, mc.cores = workers),
+                  error = function(e) { ok <<- FALSE; e })
+  if (!ok || inherits(out, "error") || is.null(out)) {
+    out <- lapply(X, FUN)
+  }
+  out
+}
+
+
+.save_rds_meta <- function(obj, path, meta) { attr(obj, "meta") <- meta; write_rds(obj, path); invisible(obj) }
+.hash_input <- function(x, n = 1000) {
+  if (is.null(x)) return(digest("NULL"))
+  if (is.data.frame(x)) {
+    nr <- nrow(x); if (is.null(nr) || nr == 0) return(digest("EMPTY"))
+    ix <- seq(1, nr, length.out = min(n, nr)) |> round() |> unique()
+    return(digest(list(names(x), x[ix, , drop = FALSE])))
+  } else if (is.character(x)) {
+    return(digest(paste0(head(x, n), collapse = "\n")))
+  } else {
+    return(digest(x))
+  }
+}
+
+stage1_clean_flags <- function(subcontracts, out_path = file.path(proc_dir, "subcontracts_with_flags.rds")) {
+  clean1 <- function(x) { x <- stringi::stri_trans_nfkc(x); x <- gsub("[\\p{Cc}\\p{Cf}]+", " ", x, perl=TRUE); x <- gsub("\\s+", " ", x); str_squish(x) }
+  is_serial_like <- function(x) { nchar(x) >= 6 && (str_count(x, "[-/]") >= 1 || str_count(x, "\\d") >= 3) && str_count(x, "\\s") <= 2 && !grepl("\\b(PROVIDE|SUPPORT|REPAIR|INSTALL)\\b", toupper(x)) }
+  is_address_like <- function(x) { u <- toupper(x); grepl("\\b(PO BOX|P\\.O\\.|SUITE|STE\\.?|BLDG|RM|FLOOR|FL|ATTN)\\b", u) || grepl("\\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV)\\b", u) || grepl("\\b\\d{5}(-\\d{4})?\\b", x) }
+  is_multiline_markup <- function(x) grepl("\\b(?:LINE\\s*\\d+|CLIN\\s*[:;\\-])", toupper(x))
+  is_junky  <- function(x) { nzchar(x) && (str_count(x, "[^\\x20-\\x7E]")/nchar(x) > 0.05) }
+  is_short  <- function(x) nchar(x) < 40
+  desc_col <- if ("expanded_description" %in% names(subcontracts)) "expanded_description" else if ("subaward_description" %in% names(subcontracts)) "subaward_description" else names(subcontracts)[1]
+  txtdf <- subcontracts %>% mutate(.row_id = row_number(),
+                                   raw_text = .data[[desc_col]] %||% "",
+                                   text_cln = clean1(raw_text),
+                                   flag_serial   = vapply(text_cln, is_serial_like,  logical(1)),
+                                   flag_address  = vapply(text_cln, is_address_like, logical(1)),
+                                   flag_multilin = vapply(text_cln, is_multiline_markup, logical(1)),
+                                   flag_junky    = vapply(text_cln, is_junky,        logical(1)),
+                                   flag_short    = vapply(text_cln, is_short,        logical(1)))
+  meta <- list(stage="stage1_clean_flags", created_at=Sys.time(), input_hash=.hash_input(subcontracts), desc_col=desc_col)
+  .save_rds_meta(txtdf, out_path, meta)
+}
+
+stage2_load_dau <- function(in_path = file.path(here("Data","acronymdict.RDS")), out_path = file.path(proc_dir, "acr_dict_dau.rds")) {
+  acr <- readRDS(in_path) %>% as_tibble()
+  nm <- names(acr)
+  if (!all(c("acr","exp") %in% nm)) {
+    colname <- nm[which.max(colSums(!is.na(acr)))]
+    lines <- acr[[colname]] |> as.character() |> str_squish()
+    lines <- lines[!is.na(lines) & nzchar(lines)]
+    split_acr <- function(txt) { m <- regexec("^(\\S{2,15})\\s+(.+)$", txt); r <- regmatches(txt, m)[[1]]; if (length(r) == 3) tibble(acr=toupper(trimws(r[2])), exp=trimws(r[3])) else tibble(acr=NA,exp=NA) }
+    acr <- bind_rows(lapply(lines, split_acr))
+  }
+  acr <- acr %>% filter(!is.na(acr), !is.na(exp), nzchar(acr), nzchar(exp)) %>% mutate(exp = str_split(exp, ";")) %>% unnest(exp) %>% mutate(acr = toupper(str_squish(acr)), exp = str_squish(exp)) %>% filter(nzchar(exp)) %>% distinct(acr, exp)
+  meta <- list(stage="stage2_load_dau", created_at=Sys.time(), input_hash=.hash_input(acr))
+  .save_rds_meta(acr, out_path, meta)
+}
+
+stage3_mine_pairs <- function(txtdf_path = file.path(proc_dir,"subcontracts_with_flags.rds"), out_path = file.path(proc_dir,"hi_conf_pairs.rds")) {
+  txtdf <- readRDS(txtdf_path)
+  pat_exp_acr <- "(?<exp>[A-Za-z][A-Za-z0-9/&\\-\\. ,]+?)\\s*\\((?<acr>[A-Z0-9][A-Z0-9&\\.\\-]{1,9})\\)"
+  pat_acr_exp <- "(?<acr>[A-Z0-9][A-Z0-9&\\.\\-]{1,9})\\s*\\((?<exp>[A-Za-z][A-Za-z0-9/&\\-\\. ,]+?)\\)"
+  extract_pairs_one <- function(txt, doc_id) {
+    if (!nzchar(txt)) return(tibble(acr=character(),exp=character(),pattern=character(),doc_id=integer()))
+    if (!str_detect(txt, "\\(")) return(tibble(acr=character(),exp=character(),pattern=character(),doc_id=integer()))
+    m1 <- str_match_all(txt, pat_exp_acr)[[1]]
+    df1 <- if (nrow(m1)) tibble(acr = m1[, "acr"], exp = m1[, "exp"], pattern = "longform_paren", doc_id = doc_id) else tibble(acr=character(),exp=character(),pattern=character(),doc_id=integer())
+    m2 <- str_match_all(txt, pat_acr_exp)[[1]]
+    df2 <- if (nrow(m2)) tibble(acr = m2[, "acr"], exp = m2[, "exp"], pattern = "acr_paren_longform", doc_id = doc_id) else tibble(acr=character(),exp=character(),pattern=character(),doc_id=integer())
+    bind_rows(df1, df2)
+  }
+  out <- map2_dfr(txtdf$text_cln, txtdf$.row_id, extract_pairs_one) %>% mutate(acr = toupper(str_squish(acr)), exp = str_squish(exp)) %>%
+    filter(nchar(acr) >= 2, nchar(exp) >= 3, !txtdf$flag_serial[doc_id], !txtdf$flag_address[doc_id], !txtdf$flag_junky[doc_id]) %>%
+    distinct(acr, exp, doc_id, pattern)
+  meta <- list(stage="stage3_mine_pairs", created_at=Sys.time(), input_hash=.hash_input(txtdf))
+  .save_rds_meta(out, out_path, meta)
+}
+
+stage4_counts_features <- function(pairs_path = file.path(proc_dir,"hi_conf_pairs.rds"),
+                                   out_dict_raw = file.path(proc_dir,"dict_all_raw.rds"),
+                                   out_feat = file.path(proc_dir,"feat_tbl.rds")) {
+  pairs <- readRDS(pairs_path)
+  dict_all_raw <- pairs %>% mutate(exp = toupper(exp)) %>% dplyr::count(acr, exp, name="freq", sort=FALSE)
+  feat_tbl <- pairs %>% mutate(exp_uc_raw = toupper(exp)) %>% distinct(acr, exp_uc = exp_uc_raw, doc_id, pattern) %>% group_by(acr, exp_uc) %>% summarise(doc_coverage=n_distinct(doc_id), def_hits=sum(pattern %in% c("longform_paren","acr_paren_longform")), .groups="drop")
+  .save_rds_meta(dict_all_raw, out_dict_raw, list(stage="stage4_counts_features", created_at=Sys.time(), input_hash=.hash_input(pairs)))
+  .save_rds_meta(feat_tbl, out_feat, list(stage="stage4_counts_features", created_at=Sys.time(), input_hash=.hash_input(pairs)))
+}
+
+stage5_canon_jw <- function(dict_raw_path = file.path(proc_dir,"dict_all_raw.rds"),
+                            dau_path = file.path(proc_dir,"acr_dict_dau.rds"),
+                            out_dict = file.path(proc_dir,"dict_all.rds"),
+                            out_map = file.path(proc_dir,"exp_map.rds"),
+                            JW_THRESH = 0.95, block_prefix = 4) {
+  dict_all_raw <- readRDS(dict_raw_path)
+  acr_dict_dau <- if (file.exists(dau_path)) readRDS(dau_path) else tibble(acr=character(),exp=character())
+  ACRONYM_KEEP <- c("DoD","USAF","USN","USMC","USA","AFOTEC","JSF","COTS","F-35","MTBF","BOM","SDRL","NSN","CLIN","NIIN","CAGE","ISR","GPS","RF","IT","AI","UAS","UAV","SATCOM")
+  connectors <- c("AND","OR","OF","THE","FOR","IN","ON","WITH","TO","BY","AT","FROM","A","AN","AS")
+  strip_leading_trailing_conn <- function(x) {
+    y <- toupper(x); y <- str_replace_all(y, "[ ]*/[ ]*", "/"); y <- str_replace_all(y, "\\s+", " "); y <- str_squish(y)
+    repeat {
+      y2 <- str_replace(y, paste0("^(", paste(connectors, collapse="|"), ")\\s+"), "")
+      y2 <- str_replace(y2, paste0("\\s+(", paste(connectors, collapse="|"), ")$"), "")
+      if (identical(y2, y)) break
+      y <- y2
+    }
+    y
+  }
+  has_content_token <- function(x) {
+    if (!nzchar(x)) return(FALSE)
+    toks <- str_split(x, "\\s+")[[1]]
+    any(nchar(toks) >= 3 | str_detect(toks, "[0-9/\\-]"))
+  }
+  dau_uc <- acr_dict_dau %>% transmute(acr=toupper(acr), exp_uc=toupper(exp))
+  dr <- dict_all_raw %>% mutate(exp_uc = strip_leading_trailing_conn(exp)) %>% filter(nzchar(exp_uc)) %>% filter(map_lgl(exp_uc, has_content_token))
+  dr <- dr %>% left_join(dau_uc %>% mutate(dau=1L), by=c("acr","exp_uc")) %>% mutate(dau = coalesce(dau, 0L))
+  rare_ok <- dr %>% group_by(acr, exp_uc) %>% summarise(freq = sum(freq), dau = max(dau), .groups="drop")
+  keep_keys <- rare_ok %>% filter(freq > 1 | dau > 0) %>% transmute(acr, exp_uc) %>% distinct()
+  dr <- dr %>% inner_join(keep_keys, by=c("acr","exp_uc")) %>% group_by(acr, exp_uc) %>% summarise(freq=sum(freq), .groups="drop")
+  dr <- dr %>% mutate(ntok = str_count(exp_uc, "\\S+"),
+                      pref = substr(exp_uc, 1, block_prefix),
+                      bucket = cut(ntok, breaks=c(-Inf,2,4,Inf), labels=c("t12","t34","t5p")))
+  by_acr <- split(dr, dr$acr)
+  worker <- function(df_acr) {
+    df_acr <- df_acr %>% arrange(desc(freq), desc(nchar(exp_uc)))
+    blocks <- split(df_acr, interaction(df_acr$pref, df_acr$bucket, drop=TRUE))
+    dict_list <- list(); map_list <- list()
+    for (bl in blocks) {
+      if (nrow(bl) == 0) next
+      ord <- order(-bl$freq, -nchar(bl$exp_uc))
+      bl <- bl[ord, , drop=FALSE]
+      n <- nrow(bl)
+      if (n == 1) {
+        dict_list[[length(dict_list)+1]] <- tibble(acr = bl$acr[1], exp_uc = bl$exp_uc[1], freq = bl$freq[1])
+        map_list[[length(map_list)+1]]  <- tibble(acr = bl$acr[1], exp_uc_raw = bl$exp_uc[1], exp_uc_canon = bl$exp_uc[1])
+        next
+      }
+      top_cap <- min(50, n)
+      S <- matrix(0, n, n)
+      for (i in seq_len(n)) {
+        jset <- seq_len(top_cap)
+        jw <- 1 - stringdist(bl$exp_uc[i], bl$exp_uc[jset], method="jw")
+        S[i, jset] <- jw
+      }
+      diag(S) <- 1
+      comp <- rep(NA_integer_, n); cid <- 0L
+      for (i in seq_len(n)) if (is.na(comp[i])) {
+        cid <- cid + 1L; q <- i; comp[i] <- cid
+        while (length(q)) {
+          v <- q[1]; q <- q[-1]
+          neigh <- which(S[v, ] >= JW_THRESH & is.na(comp))
+          if (length(neigh)) { comp[neigh] <- cid; q <- c(q, neigh) }
+        }
+      }
+      clusters <- split(seq_len(n), comp)
+      for (ix in clusters) {
+        pick <- ix[order(-bl$freq[ix], -nchar(bl$exp_uc[ix]))][1]
+        dict_list[[length(dict_list)+1]] <- tibble(acr=bl$acr[pick], exp_uc=bl$exp_uc[pick], freq=sum(bl$freq[ix]))
+        map_list[[length(map_list)+1]]  <- tibble(acr=bl$acr[ix], exp_uc_raw=bl$exp_uc[ix], exp_uc_canon=bl$exp_uc[pick])
+      }
+    }
+    list(dict=bind_rows(dict_list), map=bind_rows(map_list))
+  }
+  res <- mclapply(by_acr, worker, mc.cores = 6)
+  dict_all <- bind_rows(lapply(res, `[[`, "dict")) %>% group_by(acr, exp_uc) %>% summarise(freq=sum(freq), .groups="drop")
+  exp_map  <- bind_rows(lapply(res, `[[`, "map"))  %>% distinct(acr, exp_uc_raw, .keep_all=TRUE)
+  .save_rds_meta(dict_all, out_dict, list(stage="stage5_canon_jw", created_at=Sys.time(), JW_THRESH=JW_THRESH, block_prefix=block_prefix))
+  .save_rds_meta(exp_map,  out_map,  list(stage="stage5_canon_jw", created_at=Sys.time(), JW_THRESH=JW_THRESH, block_prefix=block_prefix))
+}
+
+stage6_score_candidates <- function(dict_path = file.path(proc_dir,"dict_all.rds"),
+                                    feat_path  = file.path(proc_dir,"feat_tbl.rds"),
+                                    dau_path   = file.path(proc_dir,"acr_dict_dau.rds"),
+                                    out_cand   = file.path(proc_dir,"acr_candidates.rds"),
+                                    out_lex    = file.path(proc_dir,"acr_lexicon.rds"),
+                                    w_def=2.5, w_freq=1.0, w_doc=0.8, w_auth=1.2, margin=0.15, topK_per_acr=2L) {
+  dict_all <- readRDS(dict_path)
+  feat_tbl <- readRDS(feat_path)
+  acr_dict_dau <- if (file.exists(dau_path)) readRDS(dau_path) else tibble(acr=character(),exp=character())
+  norm_exp <- function(x) { x %>% toupper() %>% str_replace_all("[ ]*/[ ]*", "/") %>% str_replace_all("\\s+", " ") %>% str_squish() }
+  dau_uc <- acr_dict_dau %>% transmute(acr=toupper(acr), exp_uc=norm_exp(exp)) %>% mutate(auth_hits=1L)
+  base <- dict_all %>% mutate(exp_uc = norm_exp(exp_uc))
+  acr_all_sources <- base %>%
+    left_join(feat_tbl, by=c("acr","exp_uc")) %>%
+    left_join(dau_uc, by=c("acr","exp_uc")) %>%
+    mutate(freq = coalesce(freq, 0L),
+           doc_coverage = coalesce(doc_coverage, 0L),
+           def_hits = coalesce(def_hits, 0L),
+           auth_hits = coalesce(auth_hits, 0L)) %>%
+    mutate(score_raw = w_def*def_hits + w_freq*log1p(freq) + w_doc*log1p(doc_coverage) + w_auth*auth_hits) %>%
+    group_by(acr) %>%
+    mutate(score = (score_raw - min(score_raw, na.rm=TRUE)) / (max(score_raw, na.rm=TRUE) - min(score_raw, na.rm=TRUE) + 1e-9),
+           rank = row_number(desc(score))) %>%
+    ungroup() %>%
+    mutate(exp_disp = exp_uc)
+  acr_candidates <- acr_all_sources
+  acr_lexicon <- acr_candidates %>% arrange(desc(score), .by_group = TRUE) %>% group_by(acr) %>%
+    summarise(best = first(exp_disp),
+              best_uc = first(exp_uc),
+              confidence = first(score),
+              alt = if (n() >= 2) nth(exp_disp, 2) else NA_character_,
+              alt_score = if (n() >= 2) nth(score, 2) else NA_real_,
+              keep_top2 = !is.na(alt_score) & (confidence - alt_score) < margin,
+              .groups="drop")
+  .save_rds_meta(acr_candidates, out_cand, list(stage="stage6_score_candidates", created_at=Sys.time(), weights=c(w_def,w_freq,w_doc,w_auth), margin=margin, topK_per_acr=topK_per_acr))
+  .save_rds_meta(acr_lexicon, out_lex, list(stage="stage6_score_candidates", created_at=Sys.time(), weights=c(w_def,w_freq,w_doc,w_auth), margin=margin, topK_per_acr=topK_per_acr))
+}
+
+
+stage7_embeddings_frozen <- function(
+  txtdf_path   = file.path(proc_dir, "subcontracts_with_flags.rds"),
+  w2v_mat_path = file.path(proc_dir, "w2v_contracts_matrix.rds"),
+  vocab_path   = file.path(proc_dir, "w2v_vocab.rds"),
+  dim = 100,
+  type = "skip-gram",
+  min_count = 5,
+  window = 8,
+  iter = 10,
+  alpha = 0.05,
+  use_ns = TRUE,
+  ns_size = 5,
+  verbose = TRUE
+) {
+
+  if (file.exists(w2v_mat_path)) {
+    return(invisible(readRDS(w2v_mat_path)))
+  }
+
+
+  txtdf <- readRDS(txtdf_path)
+
+  corp <- quanteda::corpus(txtdf$text_cln)
+  toks <- quanteda::tokens(
+            corp,
+            remove_punct   = TRUE,
+            remove_symbols = TRUE
+          ) |>
+          quanteda::tokens_remove(quanteda::stopwords("en"), padding = TRUE) |>
+          quanteda::tokens_tolower()
+
+
+  w2v <- wordvector::textmodel_word2vec(
+    x         = toks,
+    dim       = dim,
+    type      = type,       # "skip-gram" or "cbow"
+    min_count = min_count,
+    window    = window,
+    iter      = iter,
+    alpha     = alpha,
+    use_ns    = use_ns,
+    ns_size   = ns_size,
+    verbose   = verbose
+  )
+
+
+  w2v_mat <- as.matrix(w2v)
+
+
+  write_rds(rownames(w2v_mat), vocab_path)
+  .save_rds_meta(
+    w2v_mat,
+    w2v_mat_path,
+    list(
+      stage      = "stage7_embeddings_frozen",
+      created_at = Sys.time(),
+      source     = "wordvector",
+      dim        = dim,
+      window     = window,
+      min_count  = min_count,
+      iter       = iter,
+      use_ns     = use_ns,
+      ns_size    = ns_size
+    )
+  )
+
+  invisible(w2v_mat)
+}
+
+
+```
+
+
+
+```{r}
+
+stage8_expand <- function(
+  mode = c("tune","full"),
+  params = list(alpha = 0.6, tau = 0.55, k_window = 8, tau_short = NULL, topK_per_acr = 2L),
+  txtdf_path      = file.path(proc_dir, "subcontracts_with_flags.rds"),
+  cand_path       = file.path(proc_dir, "acr_candidates.rds"),
+  w2v_path        = file.path(proc_dir, "w2v_contracts_matrix.rds"),
+  sample_idx_path = file.path(proc_dir, "sample_idx.rds"),
+  out_metrics     = file.path(proc_dir, "expanded_sample_metrics.rds"),
+  out_preview     = file.path(proc_dir, "expanded_sample_preview.rds"),
+  out_full        = file.path(proc_dir, "subcontracts_expanded.rds"),
+  workers = 6
+) {
+
+  `%||%` <- if (exists("%||%", mode = "function")) get("%||%") else function(x, y) if (is.null(x)) y else x
+  .safe_apply <- function(X, FUN, workers = 6) {
+    workers <- as.integer(max(1L, workers))
+    if (.Platform$OS.type == "windows" || workers == 1L) return(lapply(X, FUN))
+    ok <- TRUE
+    out <- tryCatch(parallel::mclapply(X, FUN, mc.cores = workers),
+                    error = function(e) { ok <<- FALSE; e })
+    if (!ok || inherits(out, "error") || is.null(out)) out <- lapply(X, FUN)
+    out
+  }
+
+  mode <- match.arg(mode)
+
+
+  txtdf          <- readRDS(txtdf_path)
+  acr_candidates <- readRDS(cand_path)
+  w2v_mat        <- readRDS(w2v_path)
+
+  
+  alpha     <- params$alpha %||% 0.6
+  tau       <- params$tau %||% 0.55
+  k_window  <- params$k_window %||% 8
+  tau_short <- params$tau_short %||% max(tau, 0.65)
+  topK      <- as.integer(params$topK_per_acr %||% 2L)
+
+
+  ACRONYM_KEEP <- c("DoD","USAF","USN","USMC","USA","AFOTEC","JSF","COTS","F-35",
+                    "MTBF","BOM","SDRL","NSN","CLIN","NIIN","CAGE","ISR","GPS",
+                    "RF","IT","AI","UAS","UAV","SATCOM")
+  KEEP_UPPER <- toupper(ACRONYM_KEEP)
+  STOP_ACR   <- c("TO","FOR","THE","AND","OF","IN","ON","AT","BY","FROM","A","AN","AS","OR")
+
+
+  looks_like_acronym <- function(tok) {
+    up <- toupper(tok)
+    if (up %in% STOP_ACR) return(FALSE)
+    if (!grepl("^[A-Z0-9&\\.\\-]{2,10}$", up)) return(FALSE)
+    if (stringr::str_count(up, "[A-Z]") < 2) return(FALSE)
+    if (grepl("^[A-Z]+$", up) && nchar(up) <= 3 && !(up %in% KEEP_UPPER)) return(FALSE)
+    TRUE
+  }
+  tokenize_for_w2v <- function(x) {
+    if (is.null(x) || is.na(x) || !nzchar(x)) return(character(0))
+    toks <- strsplit(tolower(x), "\\s+")[[1]]
+    toks[nzchar(toks)]
+  }
+  embed_phrase_w2v <- function(phrase) {
+    toks <- tokenize_for_w2v(phrase)
+    if (!length(toks)) return(rep(0, ncol(w2v_mat)))
+    idx <- match(toks, rownames(w2v_mat))
+    idx <- idx[!is.na(idx)]
+    if (!length(idx)) return(rep(0, ncol(w2v_mat)))
+    colMeans(w2v_mat[idx, , drop = FALSE])
+  }
+  cosine_sim <- function(a, b) {
+    na <- sqrt(sum(a*a)); nb <- sqrt(sum(b*b))
+    if (na == 0 || nb == 0) return(0)
+    sum(a*b)/(na*nb)
+  }
+
+
+  acr_tbl <- acr_candidates %>%
+    dplyr::arrange(dplyr::desc(score)) %>%
+    dplyr::group_by(acr) %>%
+    dplyr::slice_head(n = topK) %>%
+    dplyr::ungroup() %>%
+    dplyr::distinct(acr, exp_uc, exp_disp, score)
+
+  acr_set <- sort(unique(acr_tbl$acr))
+  exp_mat <- do.call(rbind, lapply(acr_tbl$exp_uc, embed_phrase_w2v))
+  if (is.null(exp_mat)) stop("exp_mat is NULL — check that w2v_mat and acr_tbl$exp_uc are non-empty.")
+  exp_mat[is.na(exp_mat)] <- 0
+
+
+  find_acrs <- function(words_vec) {
+    up <- toupper(words_vec)
+    ix <- which(vapply(words_vec, looks_like_acronym, logical(1)))
+    if (!length(ix)) return(tibble::tibble(pos = integer(0), acr = character(0)))
+    up2  <- up[ix]
+    keep <- (up2 %in% acr_set) & !(up2 %in% KEEP_UPPER)
+    ix   <- ix[keep]
+    if (!length(ix)) return(tibble::tibble(pos = integer(0), acr = character(0)))
+    tibble::tibble(pos = ix, acr = up[ix])
+  }
+  context_string <- function(v, i, k) {
+    lo <- max(1L, i - k); hi <- min(length(v), i + k)
+    paste(v[lo:hi], collapse = " ")
+  }
+  score_best_expansion <- function(win_txt, acr_here) {
+    ctx_vec <- embed_phrase_w2v(win_txt)
+    cand_ix <- which(acr_tbl$acr == acr_here)
+    if (!length(cand_ix)) return(NULL)
+    sims  <- vapply(cand_ix, function(j) cosine_sim(ctx_vec, exp_mat[j, ]), numeric(1))
+    sims[is.na(sims)] <- 0
+    prior <- acr_tbl$score[cand_ix]; prior[is.na(prior)] <- 0
+    s <- alpha * sims + (1 - alpha) * prior
+    j <- which.max(s)
+    tibble::tibble(
+      exp_disp = acr_tbl$exp_disp[cand_ix][j],
+      exp_uc   = acr_tbl$exp_uc[cand_ix][j],
+      sim      = sims[j],
+      prior    = prior[j],
+      local    = s[j]
+    )
+  }
+
+  expand_one <- function(txt, short_flag = FALSE, serial_flag = FALSE, address_flag = FALSE, junky_flag = FALSE) {
+    if (is.na(txt) || !nzchar(txt) || serial_flag || address_flag || junky_flag) {
+      return(list(text = txt, acrs = character(0), n = 0L, mean_local = NA_real_, ambig = FALSE))
+    }
+    words <- strsplit(txt, "\\s+")[[1]]
+    if (!any(grepl("[A-Z]", words))) {
+      return(list(text = txt, acrs = character(0), n = 0L, mean_local = NA_real_, ambig = FALSE))
+    }
+    found <- find_acrs(words)
+    if (!nrow(found)) {
+      return(list(text = txt, acrs = character(0), n = 0L, mean_local = NA_real_, ambig = FALSE))
+    }
+    picks <- vector("list", nrow(found))
+    for (r in seq_len(nrow(found))) {
+      win <- context_string(words, found$pos[r], k_window)
+      sc  <- score_best_expansion(win, found$acr[r])
+      if (is.null(sc)) sc <- tibble::tibble(exp_disp = NA_character_, exp_uc = NA_character_, sim = 0, prior = 0, local = -Inf)
+      picks[[r]] <- sc
+    }
+    P <- dplyr::bind_rows(picks)
+
+    gate <- if (short_flag) tau_short else tau
+    if (short_flag && nrow(P)) {
+      best <- which.max(P$local)
+      if (length(best)) P$local[-best] <- -Inf
+    }
+
+    replace_ix <- which(!is.na(P$exp_disp) & P$local > gate)
+    if (length(replace_ix)) {
+      for (j in replace_ix) {
+        i <- found$pos[j]
+        a <- found$acr[j]
+        words[i] <- paste0(P$exp_disp[j], " (", a, ")")
+      }
+    }
+
+    list(
+      text       = paste(words, collapse = " "),
+      acrs       = unique(found$acr),
+      n          = length(replace_ix),
+      mean_local = ifelse(length(replace_ix), mean(P$local[replace_ix], na.rm = TRUE), NA_real_),
+      ambig      = FALSE
+    )
+  }
+
+  if (identical(mode, "tune")) {
+    if (file.exists(sample_idx_path)) {
+      idx <- readRDS(sample_idx_path)
+    } else {
+      set.seed(42)
+
+      lens <- nchar(txtdf$text_cln)
+      brk  <- stats::quantile(lens, probs = c(0, .25, .5, .75, 1), na.rm = TRUE)
+      brk  <- sort(unique(as.numeric(brk)))
+      if (length(brk) < 2 || !all(is.finite(brk))) {
+        txtdf$len_bucket <- factor("all", levels = "all")
+      } else {
+        if (any(diff(brk) == 0)) {
+          eps <- seq_along(brk) * 1e-8
+          brk <- brk + eps
+        }
+        txtdf$len_bucket <- cut(lens, breaks = brk, include.lowest = TRUE, right = TRUE)
+      }
+
+      has_acr <- vapply(strsplit(txtdf$text_cln, "\\s+"),
+                        function(w) any(vapply(w, looks_like_acronym, logical(1))), logical(1))
+      txtdf$has_acr <- has_acr
+
+      txtdf$grp <- interaction(
+        txtdf$flag_short, txtdf$flag_serial, txtdf$flag_address, txtdf$flag_junky,
+        txtdf$len_bucket, txtdf$has_acr, drop = TRUE
+      )
+      # group sizes
+      S <- tibble::tibble(grp = txtdf$grp) |>
+        dplyr::group_by(grp) |>
+        dplyr::summarise(n = dplyr::n(), .groups = "drop")
+
+      target <- min(10000L, nrow(txtdf))
+      prop   <- if (nrow(txtdf) > 0) min(1, target / nrow(txtdf)) else 1
+      take_per_grp <- pmax(1L, floor(S$n * prop))
+      if (sum(take_per_grp) > target && sum(take_per_grp) > 0) {
+        scale <- target / sum(take_per_grp)
+        take_per_grp <- pmax(1L, floor(take_per_grp * scale))
+      }
+
+      idx <- integer(0)
+      for (k in seq_len(nrow(S))) {
+        ids  <- which(txtdf$grp == S$grp[k])
+        take <- min(take_per_grp[k], length(ids))
+        if (take > 0) idx <- c(idx, sample(ids, take))
+      }
+      idx <- sort(unique(idx))
+      readr::write_rds(idx, sample_idx_path)
+    }
+
+
+    shard_ix <- split(idx, cut(seq_along(idx), 6, labels = FALSE))
+    worker_fun <- function(ix) {
+      res <- mapply(function(t, sh, se, ad, ju) expand_one(t, sh, se, ad, ju),
+                    t  = txtdf$text_cln[ix],
+                    sh = txtdf$flag_short[ix],
+                    se = txtdf$flag_serial[ix],
+                    ad = txtdf$flag_address[ix],
+                    ju = txtdf$flag_junky[ix],
+                    SIMPLIFY = FALSE)
+      list(ix = ix, res = res)
+    }
+    outs    <- .safe_apply(shard_ix, worker_fun, workers = workers)
+    ix_all  <- unlist(lapply(outs, `[[`, "ix"))
+    res_all <- unlist(lapply(outs, `[[`, "res"), recursive = FALSE)
+    ord     <- order(match(ix_all, idx))
+    res_all <- res_all[ord]
+
+    expanded_text <- vapply(res_all, function(x) x$text, character(1))
+    nrep          <- vapply(res_all, function(x) x$n, integer(1))
+    score_mean    <- vapply(res_all, function(x) x$mean_local, numeric(1))
+    raw_nchar     <- nchar(txtdf$text_cln[idx])
+
+    tok_counts    <- vapply(strsplit(txtdf$text_cln[idx], "\\s+"), length, integer(1))
+    total_tokens  <- sum(tok_counts)
+    repl_per_1k   <- ifelse(total_tokens > 0, 1000 * sum(nrep) / total_tokens, NA_real_)
+    share_lines   <- mean(nrep > 0)
+    med_local     <- stats::median(score_mean[is.finite(score_mean)], na.rm = TRUE)
+    p90_local     <- stats::quantile(score_mean[is.finite(score_mean)], 0.9, na.rm = TRUE, names = FALSE)
+
+    metrics <- tibble::tibble(
+      alpha = alpha, tau = tau, k_window = k_window, topK = topK,
+      repl_per_1k = repl_per_1k, share_lines = share_lines,
+      median_score = med_local, p90_score = p90_local,
+      total_tokens = total_tokens, sample_n = length(idx),
+      created_at = Sys.time()
+    )
+    preview <- tibble::tibble(
+      row_id    = idx,
+      raw       = txtdf$text_cln[idx],
+      expanded  = expanded_text,
+      num_repl  = nrep,
+      mean_local= score_mean,
+      raw_nchar = raw_nchar
+    )
+
+    .save_rds_meta(
+      metrics, out_metrics,
+      list(stage = "stage8_expand_tune", created_at = Sys.time(),
+           params = list(alpha = alpha, tau = tau, k_window = k_window, topK = topK))
+    )
+    .save_rds_meta(
+      preview, out_preview,
+      list(stage = "stage8_expand_tune", created_at = Sys.time(),
+           params = list(alpha = alpha, tau = tau, k_window = k_window, topK = topK))
+    )
+    return(invisible(list(metrics = metrics, preview = preview)))
+  }
+
+  n <- nrow(txtdf)
+  if (n == 0L) {
+    warning("No rows in txtdf; nothing to expand.")
+    empty <- txtdf %>%
+      dplyr::mutate(
+        expanded_description = text_cln,
+        acronyms_found       = replicate(0, character(0), simplify = FALSE),
+        num_expanded_tokens  = integer(n),
+        mean_local_score     = rep(NA_real_, n),
+        ambiguity_flag       = rep(FALSE, n)
+      ) %>%
+      dplyr::select(-.row_id, -raw_text)
+    .save_rds_meta(empty, out_full,
+                   list(stage="stage8_expand_full", created_at=Sys.time(),
+                        params=list(alpha=alpha, tau=tau, k_window=k_window, topK=topK)))
+    return(invisible(empty))
+  }
+
+  workers <- min(as.integer(workers), max(1L, n))
+  cutpoints <- floor(seq(0, n, length.out = workers + 1L))
+  splits <- lapply(seq_len(workers), function(i) {
+    if (cutpoints[i] + 1L <= cutpoints[i + 1L]) (cutpoints[i] + 1L):cutpoints[i + 1L] else integer(0)
+  })
+  splits <- splits[vapply(splits, length, integer(1)) > 0]
+
+  worker_fun <- function(ix) {
+    if (!length(ix)) return(list(ix = integer(0), res = list()))
+    res <- mapply(function(t, sh, se, ad, ju) expand_one(t, sh, se, ad, ju),
+                  t  = txtdf$text_cln[ix],
+                  sh = txtdf$flag_short[ix],
+                  se = txtdf$flag_serial[ix],
+                  ad = txtdf$flag_address[ix],
+                  ju = txtdf$flag_junky[ix],
+                  SIMPLIFY = FALSE)
+    list(ix = ix, res = res)
+  }
+
+  outs <- .safe_apply(splits, worker_fun, workers = workers)
+  if (is.null(outs) || !length(outs)) outs <- list(worker_fun(seq_len(n)))
+
+  out_list <- vector("list", n)
+  for (o in outs) {
+    if (is.null(o) || is.null(o$ix) || is.null(o$res)) next
+    out_list[o$ix] <- o$res
+  }
+
+  missing_ix <- which(vapply(out_list, is.null, logical(1)))
+  if (length(missing_ix)) {
+    for (i in missing_ix) {
+      out_list[[i]] <- list(
+        text       = txtdf$text_cln[i],
+        acrs       = character(0),
+        n          = 0L,
+        mean_local = NA_real_,
+        ambig      = FALSE
+      )
+    }
+    warning(sprintf("Recovered %d missing shards; using original text for those rows.", length(missing_ix)))
+  }
+
+  expanded_description <- vapply(out_list, function(x) x$text, character(1))
+  acronyms_found       <- lapply(out_list, function(x) x$acrs)
+  num_expanded_tokens  <- vapply(out_list, function(x) x$n, integer(1))
+  mean_local_score     <- vapply(out_list, function(x) x$mean_local, numeric(1))
+  ambiguity_flag       <- vapply(out_list, function(x) x$ambig, logical(1))
+
+  out <- txtdf %>%
+    dplyr::mutate(
+      expanded_description = expanded_description,
+      acronyms_found       = acronyms_found,
+      num_expanded_tokens  = num_expanded_tokens,
+      mean_local_score     = mean_local_score,
+      ambiguity_flag       = ambiguity_flag
+    ) %>%
+    dplyr::select(-.row_id, -raw_text)
+
+  .save_rds_meta(out, out_full,
+                 list(stage="stage8_expand_full", created_at=Sys.time(),
+                      params=list(alpha=alpha, tau=tau, k_window=k_window, topK=topK),
+                      workers_used = workers))
+  invisible(out)
+}
+
+
+```
+
+
+
+```{r}
+
+
+
+proc_dir <- file.path(getwd(), "Data", "processed")
+if (!dir_exists(proc_dir)) dir_create(proc_dir, recurse = TRUE)
+.build_log_path <- file.path(proc_dir, "build_log.txt")
+
+.log <- function(...) {
+  ts <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+  msg <- paste(..., collapse = " ")
+  line <- paste0(ts, " | ", msg, "\n")
+  cat(line)
+  try(write(line, file = .build_log_path, append = TRUE), silent = TRUE)
+  invisible(NULL)
+}
+
+.timeit <- function(label, expr) {
+  .log(label, "START")
+  t0 <- proc.time()
+  val <- force(expr)
+  dt <- proc.time() - t0
+  sec <- as.numeric(dt["user.self"] + dt["sys.self"])
+  .log(label, "DONE", sprintf("(%.1f sec)", sec))
+  invisible(val)
+}
+
+run_build_once <- function() {
+  .timeit("stage1_clean_flags", stage1_clean_flags(subcontracts))
+  .timeit("stage2_load_dau",    stage2_load_dau())
+  .timeit("stage3_mine_pairs",  stage3_mine_pairs())
+  .timeit("stage4_counts_features", stage4_counts_features())
+  .timeit("stage5_canon_jw",    stage5_canon_jw())
+  .timeit("stage6_score_candidates", stage6_score_candidates())
+  .timeit("stage7_embeddings_frozen", stage7_embeddings_frozen())
+  .log("BUILD_COMPLETE")
+  invisible(TRUE)
+}
+
+run_expand_tune <- function(alpha = 0.6, tau = 0.55, k_window = 8, topK = 2L, workers = 6) {
+  p <- list(alpha = alpha, tau = tau, k_window = k_window, topK_per_acr = topK)
+  .timeit(
+    sprintf("stage8_expand[TUNE] a=%.2f tau=%.2f k=%d topK=%d", alpha, tau, k_window, topK),
+    stage8_expand(mode = "tune", params = p, workers = workers)
+  )
+}
+
+run_expand_full <- function(alpha = 0.6, tau = 0.55, k_window = 8, topK = 2L, workers = 6) {
+  p <- list(alpha = alpha, tau = tau, k_window = k_window, topK_per_acr = topK)
+  .timeit(
+    sprintf("stage8_expand[FULL] a=%.2f tau=%.2f k=%d topK=%d", alpha, tau, k_window, topK),
+    stage8_expand(mode = "full", params = p, workers = workers)
+  )
+}
+
+
+print_stage_sizes <- function() {
+  p <- function(x) file.path(proc_dir, x)
+  fmt <- function(x) if (file.exists(x)) file_info(x)$size else NA
+  sizes <- tibble::tibble(
+    file = c(
+      "subcontracts_with_flags.rds",
+      "acr_dict_dau.rds",
+      "hi_conf_pairs.rds",
+      "dict_all_raw.rds",
+      "feat_tbl.rds",
+      "dict_all.rds",
+      "exp_map.rds",
+      "acr_candidates.rds",
+      "acr_lexicon.rds",
+      "w2v_contracts_matrix.rds",
+      "sample_idx.rds",
+      "expanded_sample_metrics.rds",
+      "expanded_sample_preview.rds",
+      "subcontracts_expanded.rds"
+    ),
+    size_bytes = vapply(file.path(proc_dir, file), fmt, numeric(1))
+  )
+  print(sizes, n = nrow(sizes))
+  invisible(sizes)
+}
+
+progress_expand_tune_seq <- function(alpha = 0.6, tau = 0.55, k_window = 8, topK = 2L) {
+  txtdf <- readRDS(file.path(proc_dir,"subcontracts_with_flags.rds"))
+  if (file.exists(file.path(proc_dir,"sample_idx.rds"))) {
+    idx <- readRDS(file.path(proc_dir,"sample_idx.rds"))
+  } else {
+    set.seed(42)
+    idx <- sort(sample(seq_len(nrow(txtdf)), min(10000L, nrow(txtdf))))
+    write_rds(idx, file.path(proc_dir,"sample_idx.rds"))
+  }
+  chunks <- split(idx, cut(seq_along(idx), 20, labels = FALSE))
+  p <- list(alpha = alpha, tau = tau, k_window = k_window, topK_per_acr = topK)
+  .log("TUNE_SEQ START", sprintf("chunks=%d", length(chunks)))
+  for (i in seq_along(chunks)) {
+    .log(sprintf("chunk %d/%d", i, length(chunks)))
+    invisible(
+      stage8_expand(
+        mode = "tune",
+        params = p,
+        workers = 1,
+        sample_idx_path = file.path(proc_dir, sprintf("sample_idx_chunk%02d.rds", i))
+      )
+    )
+  }
+  .log("TUNE_SEQ DONE")
+  invisible(TRUE)
+}
+
+options(wordvector_threads = 6) 
+
+
+```
+
+
+
+```{r}
+
+
+```
+
+
+
+```{}
+
+```
+
+
+
+
+```{}
+
+```
+
+
+
+
+```{}
+
+```
+
+
+
+
+```{}
+
+```
+
+
+
+
+```{}
+
+```
