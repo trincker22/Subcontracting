@@ -5,23 +5,18 @@ date: "2025-09-09"
 ---
 
 ```{r}
-library(readr)
+
 library(dplyr)
 library(stringr)
-library(tidyr)
 library(here)
-library(readr)
-library(stringr)
-library(dplyr)
 library(readxl)
 library(lubridate)
 library(purrr)
+library(arrow)
 
-
-
-dir_in <- here("Data", "SAM_ER", "Input")
-map_xlsx <- here("Data", "SAM_ER", "SAM_MAP.xlsx")
-
+dir_in   <- here("Data","SAM_ER","Input")
+map_xlsx <- here("Data","SAM_ER","SAM_MAP.xlsx")
+out_dir  <- file.path(dir_in, "parquet_public_v2")
 
 map <- read_excel(map_xlsx, sheet = "Data Element Mapping", skip = 3, col_types = "text")
 hdr_public <- map |>
@@ -31,10 +26,13 @@ hdr_public <- map |>
   arrange(`Column Order`) |>
   pull(`SAM Data Element List`)
 
-parse_sam_public_dat <- function(file, headers = hdr_public) {
-  con <- file(file, open = "r", encoding = "UTF-8")
-  on.exit(close(con))
-  out <- vector("list", 0L); i <- 0L
+safe_ymd <- function(x) suppressWarnings(lubridate::ymd(x))
+
+parse_write_arrow <- function(file, headers = hdr_public, out_dir = out_dir) {
+  con <- file(file, open = "r", encoding = "UTF-8"); on.exit(close(con))
+  header_line <- readLines(con, n = 1, warn = FALSE)
+  snap <- stringr::str_extract(header_line, "\\b(19|20)\\d{6}\\b") |> safe_ymd() |> as.character()
+  i <- 0L
   repeat {
     lines <- readLines(con, n = 100000L, warn = FALSE)
     if (!length(lines)) break
@@ -43,47 +41,128 @@ parse_sam_public_dat <- function(file, headers = hdr_public) {
     lines <- lines[!grepl("^(BOF|EOF)\\s", lines)]
     lines <- sub("!end\\s*$", "", lines, perl = TRUE)
     if (!length(lines)) next
-    pieces <- strsplit(lines, "|", fixed = TRUE)
-    mats <- lapply(pieces, function(x) {
-      length(x) <- length(headers)
-      x
-    })
-    m <- do.call(rbind, mats)
-    df <- as.data.frame(m, stringsAsFactors = FALSE)
+    parts <- strsplit(lines, "|", fixed = TRUE)
+    mats  <- lapply(parts, function(x){ length(x) <- length(headers); x })
+    m     <- do.call(rbind, mats)
+    df    <- as.data.frame(m, stringsAsFactors = FALSE)
     names(df) <- headers
     df[df == ""] <- NA_character_
+    dc <- intersect(c("INITIAL REGISTRATION DATE","REGISTRATION EXPIRATION DATE","LAST UPDATE DATE","ACTIVATION DATE","ENTITY START DATE"), names(df))
+    if (length(dc)) df[dc] <- lapply(df[dc], safe_ymd)
+    df$SNAPSHOT <- snap
+    df$SOURCE   <- basename(file)
+    part_dir <- file.path(out_dir, paste0("SNAPSHOT=", snap))
+    dir.create(part_dir, recursive = TRUE, showWarnings = FALSE)
     i <- i + 1L
-    out[[i]] <- df
+    arrow::write_parquet(df, file.path(part_dir, sprintf("%s_%05d.parquet", tools::file_path_sans_ext(basename(file)), i)))
   }
-  bind_rows(out)
+  invisible(TRUE)
 }
 
-
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 files <- list.files(dir_in, pattern = "\\.dat$", full.names = TRUE)
-all_df <- map_dfr(files, ~parse_sam_public_dat(.x), .id = "source_file")
+walk(files, ~ parse_write_arrow(.x, headers = hdr_public, out_dir = out_dir))
 
 
-date_cols <- intersect(
-  c("INITIAL REGISTRATION DATE","REGISTRATION EXPIRATION DATE",
-    "LAST UPDATE DATE","ACTIVATION DATE","ENTITY START DATE"),
-  names(all_df)
+```
+
+```{r}
+
+
+dir_in   <- here("Data","SAM_ER","Input")
+map_xlsx <- here("Data","SAM_ER","SAM_MAP.xlsx")
+src_dir  <- file.path(dir_in, "parquet_public_v2")
+out_all  <- file.path(dir_in, "parquet_public_all")
+out_latest <- file.path(dir_in, "parquet_public_latest_entity")
+out_lookup <- file.path(dir_in, "parquet_public_lookup_latest")
+
+map <- read_excel(map_xlsx, sheet = "Data Element Mapping", skip = 3, col_types = "text")
+hdr_public <- map |>
+  filter(Public == "X") |>
+  mutate(`Column Order` = suppressWarnings(as.numeric(`Column Order`))) |>
+  filter(!is.na(`Column Order`)) |>
+  arrange(`Column Order`) |>
+  pull(`SAM Data Element List`)
+
+ds <- arrow::open_dataset(src_dir)
+
+ds_all <- ds |>
+  select(any_of(c(hdr_public,"SNAPSHOT","SOURCE"))) |>
+  distinct()
+
+if (dir.exists(out_all)) unlink(out_all, recursive = TRUE)
+ds_all |>
+  group_by(SNAPSHOT) |>
+  write_dataset(out_all, format = "parquet", existing_data_behavior = "overwrite")
+
+na_tokens <- c("NA","N/A","NOT AVAILABLE","NO LONGER AVAILABLE","NO LONGER AVALIABLE","NO LONGER AVAIL.","NOT APPLICABLE","NONE","UNKNOWN")
+norm_id <- function(x){ x <- toupper(trimws(x)); x[x %in% na_tokens] <- NA_character_; x }
+
+id_cols <- c(
+  "UNIQUE ENTITY ID","DUNS NUMBER","CAGE CODE","LEGAL BUSINESS NAME",
+  "PHYSICAL ADDRESS LINE 1","PHYSICAL ADDRESS CITY","PHYSICAL ADDRESS PROVINCE OR STATE",
+  "PHYSICAL ADDRESS COUNTRY CODE","PHYSICAL ADDRESS ZIP/POSTAL CODE",
+  "PRIMARY NAICS","NAICS CODE STRING","PSC CODE STRING","SNAPSHOT","SOURCE"
 )
-all_df[date_cols] <- lapply(all_df[date_cols], ~ suppressWarnings(ymd(.x)))
+
+tbl <- arrow::open_dataset(out_all) |>
+  select(any_of(id_cols)) |>
+  collect()
 
 
+try <- tbl %>% 
+  sample_n(80)
+
+glimpse(tbl)
+
+tbl <- tbl |>
+  mutate(
+    UEI  = norm_id(`UNIQUE ENTITY ID`),
+    CAGE = norm_id(`CAGE CODE`),
+    LBN  = toupper(trimws(`LEGAL BUSINESS NAME`)),
+    K_ADDR = paste0(
+      toupper(trimws(`PHYSICAL ADDRESS LINE 1`)),"|",
+      toupper(trimws(`PHYSICAL ADDRESS CITY`)),"|",
+      toupper(trimws(`PHYSICAL ADDRESS PROVINCE OR STATE`)),"|",
+      toupper(trimws(`PHYSICAL ADDRESS COUNTRY CODE`)),"|",
+      toupper(trimws(`PHYSICAL ADDRESS ZIP/POSTAL CODE`))
+    ),
+    FALLBACK = ifelse(!is.na(CAGE) & !is.na(LBN), paste0(CAGE,"|",LBN),
+                      ifelse(!is.na(LBN) & !is.na(K_ADDR), paste0(LBN,"|",K_ADDR), NA_character_)),
+    ENTITY_KEY = coalesce(UEI, FALLBACK)
+  ) |>
+  filter(!is.na(ENTITY_KEY))
+
+xwalk_duns_uei <- tbl |>
+  filter(!is.na(UEI), !is.na(DUNS)) |>
+  arrange(DUNS, desc(SNAPSHOT)) |>
+  distinct(DUNS, UEI, .keep_all = FALSE)
+
+tbl_bf <- tbl |>
+  left_join(xwalk_duns_uei, by = "DUNS", multiple = "any") |>
+  mutate(UEI_BF = coalesce(UEI, UEI.y)) |>
+  select(-UEI.y)
+
+latest_by_entity <- tbl_bf |>
+  group_by(ENTITY_KEY) |>
+  summarize(SNAPSHOT = max(SNAPSHOT, na.rm = TRUE), .groups = "drop")
+
+latest_rows <- tbl_bf |>
+  inner_join(latest_by_entity, by = c("ENTITY_KEY","SNAPSHOT"))
+
+if (dir.exists(out_latest)) unlink(out_latest, recursive = TRUE)
+arrow::write_parquet(latest_rows, file.path(out_latest, "latest_entity.parquet"))
+
+lookup <- latest_rows |>
+  select(any_of(c("ENTITY_KEY","UEI_BF","DUNS","CAGE","LEGAL BUSINESS NAME","PRIMARY NAICS","NAICS CODE STRING","PSC CODE STRING","SNAPSHOT"))) |>
+  distinct()
+
+if (dir.exists(out_lookup)) unlink(out_lookup, recursive = TRUE)
+lookup |>
+  group_by(SNAPSHOT) |>
+  write_dataset(out_lookup, format = "parquet", existing_data_behavior = "overwrite")
 
 
-```
-
-```{r}
-
-```
-
-```{r}
-
-```
-
-```{r}
 
 ```
 
