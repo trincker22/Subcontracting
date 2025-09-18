@@ -9,7 +9,7 @@ This notebook builds a reproducible, restartable pipeline for mining, scoring, a
 
 The pipeline runs in numbered stages and writes a small set of versionable RDS files at each step so you can delete from any stage and re-run cleanly.
 
-Stage 1 normalizes text and computes flags. We standardize text (Unicode NFKC), remove control characters, collapse whitespace, and apply an ASCII-clean “mojibake fix” that also strips common CLIN/LINE markup variants. We compute lightweight flags: flag\_serial (serial/part-code–like), flag\_multilin (residual LINE/CLIN markup), flag\_junky (original had >5% non-ASCII), and flag\_short (very short lines). We no longer compute or use an address flag.
+Stage 1 normalizes text and computes flags. We standardize text (Unicode NFKC), remove control characters, collapse whitespace, and apply an ASCII-clean “mojibake fix” that also strips common CLIN/LINE markup variants. We compute lightweight flags: flag\_serial (serial/part-code–like), flag\_multilin (residual LINE/CLIN markup), flag\_junky (original had >5% non-ASCII), and flag\_short (very short lines). 
 
 Stage 2 loads an external acronym dictionary (DAU). Data/acronymdict.RDS may be a tidy two-column (acr, exp) or a free-text single column with lines like “ACR expansion”. We split on semicolons, uppercase and trim, dedupe, and write a clean table.
 
@@ -748,9 +748,13 @@ stage8_expand <- function(
   out_metrics     = file.path(proc_dir, "expanded_sample_metrics.rds"),
   out_preview     = file.path(proc_dir, "expanded_sample_preview.rds"),
   out_full        = file.path(proc_dir, "subcontracts_expanded.rds"),
+  out_metrics_full = file.path(proc_dir, "expanded_full_metrics.rds"),
+  out_preview_full = file.path(proc_dir, "expanded_full_preview.rds"),
+  preview_full_n   = 5000L,
   workers = 6
 ) {
   `%||%` <- if (exists("%||%", mode = "function")) get("%||%") else function(x, y) if (is.null(x)) y else x
+
   .safe_apply <- function(X, FUN, workers = 6) {
     workers <- as.integer(max(1L, workers))
     if (.Platform$OS.type == "windows" || workers == 1L) return(lapply(X, FUN))
@@ -761,14 +765,34 @@ stage8_expand <- function(
     out
   }
 
+  normalize_res <- function(x, fallback_txt = "") {
+    # Ensure shape for vapply; never return NULL/length-0 fields
+    if (is.null(x) || is.null(x$text) || !length(x$text)) {
+      return(list(
+        text          = as.character(fallback_txt),
+        acrs_detected = character(0),
+        n             = 0L,
+        mean_local    = NA_real_,
+        max_local     = NA_real_,
+        why           = "normalized_empty"
+      ))
+    }
+    x$text       <- as.character(x$text)[1]
+    x$n          <- as.integer(x$n %||% 0L)
+    x$mean_local <- if (length(x$mean_local)) as.numeric(x$mean_local[1]) else NA_real_
+    x$max_local  <- if (length(x$max_local))  as.numeric(x$max_local[1])  else NA_real_
+    x$acrs_detected <- as.character(x$acrs_detected %||% character(0))
+    x$why        <- as.character(x$why %||% "ok")[1]
+    x
+  }
+
   mode <- match.arg(mode)
 
-  # Inputs
+  # ---------- Inputs ----------
   txtdf          <- readRDS(txtdf_path)
   acr_candidates <- readRDS(cand_path)
   w2v_mat        <- readRDS(w2v_path)
   texts_for_expansion <- txtdf$text_fix %||% txtdf$text_cln
-
 
   alpha     <- params$alpha %||% 0.6
   tau       <- params$tau %||% 0.55
@@ -776,13 +800,12 @@ stage8_expand <- function(
   tau_short <- params$tau_short %||% tau
   topK      <- as.integer(params$topK_per_acr %||% 2L)
 
-
   ACRONYM_KEEP <- c("DoD","USAF","USN","USMC","USA","AFOTEC","JSF","COTS","F-35",
                     "MTBF","BOM","SDRL","NSN","CLIN","NIIN","CAGE","ISR","GPS",
                     "RF","IT","AI","UAS","UAV","SATCOM")
   KEEP_UPPER <- toupper(ACRONYM_KEEP)
 
-
+  # Build acronym universe (candidates ∪ DAU), restricted to short all-caps with &/. allowed
   dau_path <- file.path(proc_dir, "acr_dict_dau.rds")
   dau_raw  <- if (file.exists(dau_path)) readRDS(dau_path) else tibble::tibble(acr=character(), exp=character())
 
@@ -790,28 +813,25 @@ stage8_expand <- function(
     toupper(acr_candidates$acr),
     toupper(dau_raw$acr)
   )))
-
   acr_universe <- acr_universe[grepl("^[A-Z&\\.]{2,5}$", acr_universe)]
-
 
   have_fastmatch <- requireNamespace("fastmatch", quietly = TRUE)
   in_set <- function(x, set) {
     if (have_fastmatch) !is.na(fastmatch::fmatch(x, set)) else x %in% set
   }
 
-
-acr_tbl <- acr_candidates %>%
-  dplyr::mutate(acr = toupper(acr)) %>%
-  dplyr::arrange(dplyr::desc(prior), dplyr::desc(score)) %>%
-  dplyr::group_by(acr) %>%
-  dplyr::slice_head(n = topK) %>%
-  dplyr::ungroup() %>%
-  dplyr::distinct(acr, exp_uc, exp_disp, prior, score)
-
+  # Top-K per acronym (keep prior if present), distinct rows
+  acr_tbl <- acr_candidates %>%
+    dplyr::mutate(acr = toupper(acr)) %>%
+    dplyr::arrange(dplyr::desc(prior), dplyr::desc(score)) %>%
+    dplyr::group_by(acr) %>%
+    dplyr::slice_head(n = topK) %>%
+    dplyr::ungroup() %>%
+    dplyr::distinct(acr, exp_uc, exp_disp, prior, score)
 
   acr_index <- split(seq_len(nrow(acr_tbl)), acr_tbl$acr)
 
-
+  # ---------- Embedding helpers ----------
   tokenize_for_w2v <- function(x) {
     if (is.null(x) || is.na(x) || !nzchar(x)) return(character(0))
     toks <- strsplit(tolower(x), "\\s+")[[1]]
@@ -840,7 +860,7 @@ acr_tbl <- acr_candidates %>%
     paste(v[lo:hi], collapse = " ")
   }
 
-
+  # ---------- Acronym detection ----------
   find_acrs <- function(words_vec) {
     if (!length(words_vec)) return(tibble::tibble(pos = integer(0), acr = character(0)))
     out_pos <- integer(0); out_acr <- character(0)
@@ -865,84 +885,82 @@ acr_tbl <- acr_candidates %>%
     tibble::tibble(pos = out_pos, acr = out_acr)
   }
 
-
+  # ---------- Scoring ----------
   score_best_expansion <- function(win_txt, acr_here) {
-  cand_ix <- acr_index[[acr_here]]
-  if (is.null(cand_ix) || !length(cand_ix)) return(NULL)
+    cand_ix <- acr_index[[acr_here]]
+    if (is.null(cand_ix) || !length(cand_ix)) return(NULL)
 
-  ctx_vec <- embed_phrase_w2v(win_txt)
-  sims <- vapply(cand_ix, function(j) cosine_sim(ctx_vec, exp_mat[j, ]), numeric(1))
-  sims[!is.finite(sims)] <- 0
+    ctx_vec <- embed_phrase_w2v(win_txt)
+    sims <- vapply(cand_ix, function(j) cosine_sim(ctx_vec, exp_mat[j, ]), numeric(1))
+    sims[!is.finite(sims)] <- 0
 
+    pr <- acr_tbl$prior[cand_ix]
+    if (is.null(pr) || !length(pr)) pr <- rep(0.5, length(cand_ix))  # fallback prior
+    pr[!is.finite(pr)] <- 0
 
-  pr <- acr_tbl$prior[cand_ix]
-  if (is.null(pr) || !length(pr)) pr <- rep(0.5, length(cand_ix))
-  pr[!is.finite(pr)] <- 0
-
-  tok_cnt <- {
-    s <- trimws(gsub("\\s+", " ", win_txt))
-    if (!nzchar(s)) 0L else length(strsplit(s, " ", fixed = TRUE)[[1]])
-  }
-  alpha_eff <- if (is.finite(tok_cnt) && tok_cnt <= 2) 0.20 else alpha
-
-  sims01 <- pmax(0, sims)
-  s <- alpha_eff * sims01 + (1 - alpha_eff) * pr
-
-
-  if (!is.null(win_txt) && length(win_txt) && (acr_here %in% c("R&D","RD"))) {
-    if (grepl("\\b(SUPPORT|SVCS|SERVICES|PROGRAM|LABOR|OPS|WORK)\\b", toupper(win_txt))) {
-      s <- s + 0.15
+    # downweight alpha on tiny contexts
+    tok_cnt <- {
+      s <- trimws(gsub("\\s+", " ", win_txt))
+      if (!nzchar(s)) 0L else length(strsplit(s, " ", fixed = TRUE)[[1]])
     }
+    alpha_eff <- if (is.finite(tok_cnt) && tok_cnt <= 2) 0.20 else alpha
+
+    sims01 <- pmax(0, sims)  # clamp negatives; keep your scale
+    s <- alpha_eff * sims01 + (1 - alpha_eff) * pr
+
+    # Example domain nudge
+    if (!is.null(win_txt) && length(win_txt) && (acr_here %in% c("R&D","RD"))) {
+      if (grepl("\\b(SUPPORT|SVCS|SERVICES|PROGRAM|LABOR|OPS|WORK)\\b", toupper(win_txt))) {
+        s <- s + 0.15
+      }
+    }
+
+    s[!is.finite(s)] <- -Inf
+    j <- which.max(s)
+
+    tibble::tibble(
+      exp_disp = acr_tbl$exp_disp[cand_ix][j],
+      exp_uc   = acr_tbl$exp_uc[cand_ix][j],
+      sim      = sims01[j],
+      prior    = pr[j],
+      local    = s[j]
+    )
   }
 
-  s[!is.finite(s)] <- -Inf
-  j <- which.max(s)
-
-  tibble::tibble(
-    exp_disp = acr_tbl$exp_disp[cand_ix][j],
-    exp_uc   = acr_tbl$exp_uc[cand_ix][j],
-    sim      = sims01[j],
-    prior    = pr[j],
-    local    = s[j]
-  )
-}
-
-
-
+  # ---------- Expand one line ----------
   expand_one <- function(txt, short_flag = FALSE, serial_flag = FALSE, junky_flag = FALSE) {
-    if (is.na(txt) || !nzchar(txt)) {
-      return(list(text = txt, acrs_detected = character(0), n = 0L,
+    txt <- as.character(txt)
+    if (!length(txt) || is.na(txt) || !nzchar(txt)) {
+      return(list(text = "", acrs_detected = character(0), n = 0L,
                   mean_local = NA_real_, max_local = NA_real_, why = "empty"))
     }
     if (serial_flag) {
-      return(list(text = txt, acrs_detected = character(0), n = 0L,
+      return(list(text = txt[1], acrs_detected = character(0), n = 0L,
                   mean_local = NA_real_, max_local = NA_real_, why = "serial"))
     }
 
-    words <- strsplit(txt, "\\s+")[[1]]
+    words <- strsplit(txt[1], "\\s+")[[1]]
     if (!length(words)) {
-      return(list(text = txt, acrs_detected = character(0), n = 0L,
+      return(list(text = txt[1], acrs_detected = character(0), n = 0L,
                   mean_local = NA_real_, max_local = NA_real_, why = "empty"))
     }
 
     found <- find_acrs(words)
     if (!nrow(found)) {
-      return(list(text = txt, acrs_detected = character(0), n = 0L,
+      return(list(text = txt[1], acrs_detected = character(0), n = 0L,
                   mean_local = NA_real_, max_local = NA_real_, why = "no_acr_found"))
     }
-
 
     keep_mask <- !(found$acr %in% KEEP_UPPER)
     found <- found[keep_mask, , drop = FALSE]
     if (!nrow(found)) {
-      return(list(text = txt, acrs_detected = character(0), n = 0L,
+      return(list(text = txt[1], acrs_detected = character(0), n = 0L,
                   mean_local = NA_real_, max_local = NA_real_, why = "kept_only"))
     }
 
-
     can_mask <- vapply(found$acr, function(a) !is.null(acr_index[[a]]), logical(1))
     if (!any(can_mask)) {
-      return(list(text = txt, acrs_detected = unique(found$acr), n = 0L,
+      return(list(text = txt[1], acrs_detected = unique(found$acr), n = 0L,
                   mean_local = NA_real_, max_local = NA_real_, why = "no_candidates"))
     }
 
@@ -968,12 +986,15 @@ acr_tbl <- acr_candidates %>%
       }
     }
 
+    max_local_any  <- suppressWarnings(ifelse(all(!is.finite(P$local)), NA_real_, max(P$local, na.rm = TRUE)))
+    mean_local_rep <- if (length(replace_ix)) mean(P$local[replace_ix], na.rm = TRUE) else NA_real_
+
     list(
       text          = paste(words, collapse = " "),
-      acrs_detected = unique(found$acr),   # includes those without candidate rows
+      acrs_detected = unique(found$acr),   # includes those without candidates
       n             = length(replace_ix),
-      mean_local    = ifelse(length(replace_ix), mean(P$local[replace_ix], na.rm = TRUE), NA_real_),
-      max_local     = suppressWarnings(ifelse(all(!is.finite(P$local)), NA_real_, max(P$local, na.rm = TRUE))),
+      mean_local    = mean_local_rep,      # mean of replacements only
+      max_local     = max_local_any,       # best observed (even if < tau)
       why           = if (length(replace_ix)) "replaced" else "below_tau"
     )
   }
@@ -1032,8 +1053,9 @@ acr_tbl <- acr_candidates %>%
 
     ord     <- order(match(ix_all, idx))
     res_all <- res_all[ord]
+    res_all <- lapply(seq_along(res_all), function(i) normalize_res(res_all[[i]], texts_for_expansion[idx][i]))
 
-    expanded_text <- vapply(res_all, function(x) if (is.null(x$text)) NA_character_ else x$text, character(1))
+    expanded_text <- vapply(res_all, function(x) x$text, character(1))
     nrep          <- vapply(res_all, function(x) x$n, integer(1))
     found_m       <- vapply(res_all, function(x) length(x$acrs_detected), integer(1))
     max_local     <- vapply(res_all, function(x) x$max_local, numeric(1))
@@ -1091,6 +1113,7 @@ acr_tbl <- acr_candidates %>%
         acronyms_found       = replicate(0, character(0), simplify = FALSE),
         num_expanded_tokens  = integer(n),
         mean_local_score     = rep(NA_real_, n),
+        best_local_score_any = rep(NA_real_, n),
         ambiguity_flag       = rep(FALSE, n)
       ) %>%
       dplyr::select(-.row_id, -raw_text)
@@ -1142,18 +1165,68 @@ acr_tbl <- acr_candidates %>%
     warning(sprintf("Recovered %d missing shards; using original text for those rows.", length(missing_ix)))
   }
 
+  # Normalize all results to avoid vapply length errors
+  out_list <- lapply(seq_along(out_list), function(i) normalize_res(out_list[[i]], texts_for_expansion[i]))
+
   expanded_description <- vapply(out_list, function(x) x$text, character(1))
   acronyms_found       <- lapply(out_list, function(x) x$acrs_detected)
   num_expanded_tokens  <- vapply(out_list, function(x) x$n, integer(1))
-  mean_local_score     <- vapply(out_list, function(x) x$mean_local, numeric(1))
+  mean_local_score     <- vapply(out_list, function(x) x$mean_local, numeric(1))   # replacements only
+  best_local_score_any <- vapply(out_list, function(x) x$max_local,  numeric(1))   # observed, even if < tau
   ambiguity_flag       <- rep(FALSE, n)
+
+  # ---- Full-run diagnostics (mirror tune) ----
+  nrep_full      <- num_expanded_tokens
+  found_m_full   <- vapply(out_list, function(x) length(x$acrs_detected), integer(1))
+  max_local_full <- best_local_score_any
+
+  tok_counts_full <- vapply(strsplit(texts_for_expansion, "\\s+"), length, integer(1))
+  total_tokens_full <- sum(tok_counts_full)
+
+  repl_per_1k_full             <- ifelse(total_tokens_full > 0, 1000 * sum(nrep_full) / total_tokens_full, NA_real_)
+  share_lines_full             <- mean(nrep_full > 0)
+  acr_per_1k_full              <- ifelse(total_tokens_full > 0, 1000 * sum(found_m_full) / total_tokens_full, NA_real_)
+  share_lines_with_acr_full    <- mean(found_m_full > 0)
+  repl_per_1k_given_found_full <- ifelse(sum(found_m_full) > 0, 1000 * sum(nrep_full) / sum(found_m_full), NA_real_)
+  med_local_all_full           <- stats::median(max_local_full[is.finite(max_local_full)], na.rm = TRUE)
+  p90_local_all_full           <- stats::quantile(max_local_full[is.finite(max_local_full)], 0.9, na.rm = TRUE, names = FALSE)
+
+  metrics_full <- tibble::tibble(
+    alpha = alpha, tau = tau, k_window = k_window, topK = topK,
+    repl_per_1k = repl_per_1k_full, share_lines = share_lines_full,
+    median_score = med_local_all_full, p90_score = p90_local_all_full,
+    total_tokens = total_tokens_full, sample_n = n,
+    acr_per_1k = acr_per_1k_full, share_lines_with_acr = share_lines_with_acr_full,
+    repl_per_1k_given_found = repl_per_1k_given_found_full
+  )
+  .save_rds_meta(metrics_full, out_metrics_full,
+                 list(stage="stage8_expand_full_metrics", created_at=Sys.time(),
+                      params=list(alpha=alpha, tau=tau, k_window=k_window, topK=topK)))
+
+  # Optional: small preview sample for eyeballing full results
+  if (is.finite(preview_full_n) && preview_full_n > 0L) {
+    keep <- if (n > preview_full_n) sort(sample.int(n, preview_full_n)) else seq_len(n)
+    preview_full <- tibble::tibble(
+      row_id     = keep,
+      raw        = texts_for_expansion[keep],
+      expanded   = expanded_description[keep],
+      num_repl   = num_expanded_tokens[keep],
+      found_acr  = found_m_full[keep],
+      best_local = best_local_score_any[keep]
+    )
+    .save_rds_meta(preview_full, out_preview_full,
+                   list(stage="stage8_expand_full_preview", created_at=Sys.time(),
+                        params=list(alpha=alpha, tau=tau, k_window=k_window, topK=topK),
+                        sample_n = length(keep)))
+  }
 
   out <- txtdf %>%
     dplyr::mutate(
       expanded_description = expanded_description,
       acronyms_found       = acronyms_found,
       num_expanded_tokens  = num_expanded_tokens,
-      mean_local_score     = mean_local_score,
+      mean_local_score     = mean_local_score,      # > tau only
+      best_local_score_any = best_local_score_any,  # observed, incl. < tau
       ambiguity_flag       = ambiguity_flag
     ) %>%
     dplyr::select(-.row_id, -raw_text)
@@ -1164,7 +1237,6 @@ acr_tbl <- acr_candidates %>%
                       workers_used = workers))
   invisible(out)
 }
-
 
 
 ```
@@ -1394,11 +1466,11 @@ run_expand_full(alpha = 0.8, tau = 0.53, k_window = 12, topK = 2L, workers = 6)
 ```
 
 ```{r}
-
+library(tidyverse)
 # pick tau 
 
 proc_dir <- file.path(here(), "Data", "processed")
-prev <- readRDS(file.path(proc_dir, "expanded_sample_preview.rds"))
+prev <- readRDS(file.path(proc_dir, "expanded_full_preview.rds"))
 
 stopifnot("best_local" %in% names(prev))
 
@@ -1410,7 +1482,7 @@ curve_df <- tibble(
 )
 
 
-tau_current <- 0.50
+tau_current <- 0.53
 
 ggplot(curve_df, aes(tau, share_above)) +
   geom_line() +
