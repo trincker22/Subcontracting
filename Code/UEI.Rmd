@@ -4,19 +4,42 @@ output: html_document
 date: "2025-09-09"
 ---
 
+This notebook builds a reproducible pipeline for transforming raw SAM entity registration files into a structured dataset of entity identifiers, NAICS codes, and PSC codes. The raw .dat files are parsed in chunks, cleaned, and stored as Parquet for efficient downstream access. Header definitions are taken from the SAM mapping file to ensure consistent column naming, and date fields are normalized. Snapshots are detected from the input filenames and retained as metadata.
+
+After parsing, the dataset is collected into a consolidated table of entities and their associated NAICS and PSC codes. Utility functions clean and tokenize NAICS strings, parse PSC codes, and identify a primary six-digit NAICS when available. The data are processed in manageable chunks using parallel execution to handle large files. The result is a harmonized table keyed by UEI with the latest available NAICS and PSC information, which is then joined to the subcontracts dataset for analysis.
+
+The pipeline then constructs conditional priors P(PSC | NAICS) using observed co-occurrence frequencies. For each NAICS category (at either the six-digit or four-digit level), the associated PSC codes are collected across all entities. If we let $n_{ij}$ denote the number of entities that list PSC $j$ under NAICS $i$, then the conditional probability is defined as
+
+$P(\text{PSC}=j \mid \text{NAICS}=i) = \frac{n_{ij}}{\sum_{k} n_{ik}}$
+
+
+This ensures that probabilities within each NAICS group sum to one. Pairs observed fewer than a chosen threshold (default of three) are discarded to reduce noise. For each NAICS, PSCs are ranked by probability, cumulative coverage is calculated, and the top-k PSCs are retained. Coverage is reported as the share of total probability mass explained by the top-kPSCs. Entropy statistics are also computed to measure concentration versus diversity of PSCs within each NAICS:
+
+$H_i = - \sum_{j} P(\text{PSC}=j \mid \text{NAICS}=i)\,\log P(\text{PSC}=j \mid \text{NAICS}=i).$
+       
+Outputs include the full conditional prior tables, the top-k PSC lists, coverage summaries, and equal-weighted NAICS summaries that highlight how concentrated PSC usage is across the NAICS distribution. All outputs are versioned and saved as RDS files for downstream analysis.
+
+Finally, the notebook produces diagnostic plots to visualize the priors. Histograms show the distribution of top-1 and top-3 conditional probabilities across NAICS6 and NAICS4, equally weighting each NAICS. Additional plots evaluate the share of subcontracts missing NAICS over time and the extent of missing coverage. Together, these steps produce a restartable, versionable pipeline for linking NAICS and PSC codes to entities and analyzing their co-occurrence structure.
+
+
+
 ```{r}
 
+library(arrow)
 library(dplyr)
 library(stringr)
-library(here)
-library(readxl)
 library(lubridate)
 library(purrr)
-library(arrow)
+library(furrr)
+library(tidyr)
+library(here)
+library(tidyverse)
 
-dir_in   <- here("Data","SAM_ER","Input")
-map_xlsx <- here("Data","SAM_ER","SAM_MAP.xlsx")
-out_dir  <- file.path(dir_in, "parquet_public_v2")
+
+dir_in      <- here("Data","SAM_ER","Input")
+map_xlsx    <- here("Data","SAM_ER","SAM_MAP.xlsx")
+out_parquet <- file.path(dir_in, "parquet_public_v3")  # new cleaned build
+dir.create(out_parquet, recursive = TRUE, showWarnings = FALSE)
 
 map <- read_excel(map_xlsx, sheet = "Data Element Mapping", skip = 3, col_types = "text")
 hdr_public <- map |>
@@ -26,12 +49,28 @@ hdr_public <- map |>
   arrange(`Column Order`) |>
   pull(`SAM Data Element List`)
 
-safe_ymd <- function(x) suppressWarnings(lubridate::ymd(x))
+mon_map <- setNames(sprintf("%02d", 1:12), c("JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"))
+snap_from_filename <- function(x){
+  b  <- basename(x)
+  mm <- stringr::str_match(b, "(\\d{4})_([A-Z]{3})")
+  if (is.null(mm) || ncol(mm) < 3) return(as.Date(NA))
+  yr  <- suppressWarnings(as.integer(mm[1,2]))
+  mon <- mm[1,3]
+  mm2 <- mon_map[[mon]]
+  if (is.na(yr) || is.null(mm2) || is.na(mm2)) return(as.Date(NA))
+  as.Date(sprintf("%04d-%s-01", yr, mm2))
+}
 
-parse_write_arrow <- function(file, headers = hdr_public, out_dir = out_dir) {
+safe_ymd <- function(x){
+  x <- as.character(x)
+  suppressWarnings(lubridate::ymd(x))
+}
+
+parse_write_arrow <- function(file, headers, out_dir){
+  snap_d <- snap_from_filename(file)
+  if (is.na(snap_d)) stop(sprintf("Could not parse snapshot from filename: %s", file))
+  snap <- as.character(snap_d)
   con <- file(file, open = "r", encoding = "UTF-8"); on.exit(close(con))
-  header_line <- readLines(con, n = 1, warn = FALSE)
-  snap <- stringr::str_extract(header_line, "\\b(19|20)\\d{6}\\b") |> safe_ymd() |> as.character()
   i <- 0L
   repeat {
     lines <- readLines(con, n = 100000L, warn = FALSE)
@@ -47,126 +86,267 @@ parse_write_arrow <- function(file, headers = hdr_public, out_dir = out_dir) {
     df    <- as.data.frame(m, stringsAsFactors = FALSE)
     names(df) <- headers
     df[df == ""] <- NA_character_
-    dc <- intersect(c("INITIAL REGISTRATION DATE","REGISTRATION EXPIRATION DATE","LAST UPDATE DATE","ACTIVATION DATE","ENTITY START DATE"), names(df))
+    dc <- intersect(c("INITIAL REGISTRATION DATE","REGISTRATION EXPIRATION DATE",
+                      "LAST UPDATE DATE","ACTIVATION DATE","ENTITY START DATE"), names(df))
     if (length(dc)) df[dc] <- lapply(df[dc], safe_ymd)
     df$SNAPSHOT <- snap
     df$SOURCE   <- basename(file)
     part_dir <- file.path(out_dir, paste0("SNAPSHOT=", snap))
     dir.create(part_dir, recursive = TRUE, showWarnings = FALSE)
     i <- i + 1L
-    arrow::write_parquet(df, file.path(part_dir, sprintf("%s_%05d.parquet", tools::file_path_sans_ext(basename(file)), i)))
+    arrow::write_parquet(
+      df,
+      file.path(part_dir, sprintf("%s_%05d.parquet",
+             tools::file_path_sans_ext(basename(file)), i))
+    )
   }
   invisible(TRUE)
 }
 
-dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-files <- list.files(dir_in, pattern = "\\.dat$", full.names = TRUE)
-walk(files, ~ parse_write_arrow(.x, headers = hdr_public, out_dir = out_dir))
+files_dat <- list.files(dir_in, pattern = "\\.dat$", full.names = TRUE)
+files_dat <- files_dat[stringr::str_detect(basename(files_dat), "\\d{4}_[A-Z]{3}")]
 
-
-```
-
-```{r}
-
-
-dir_in   <- here("Data","SAM_ER","Input")
-map_xlsx <- here("Data","SAM_ER","SAM_MAP.xlsx")
-src_dir  <- file.path(dir_in, "parquet_public_v2")
-out_all  <- file.path(dir_in, "parquet_public_all")
-out_latest <- file.path(dir_in, "parquet_public_latest_entity")
-out_lookup <- file.path(dir_in, "parquet_public_lookup_latest")
-
-map <- read_excel(map_xlsx, sheet = "Data Element Mapping", skip = 3, col_types = "text")
-hdr_public <- map |>
-  filter(Public == "X") |>
-  mutate(`Column Order` = suppressWarnings(as.numeric(`Column Order`))) |>
-  filter(!is.na(`Column Order`)) |>
-  arrange(`Column Order`) |>
-  pull(`SAM Data Element List`)
-
-ds <- arrow::open_dataset(src_dir)
-
-ds_all <- ds |>
-  select(any_of(c(hdr_public,"SNAPSHOT","SOURCE"))) |>
-  distinct()
-
-if (dir.exists(out_all)) unlink(out_all, recursive = TRUE)
-ds_all |>
-  group_by(SNAPSHOT) |>
-  write_dataset(out_all, format = "parquet", existing_data_behavior = "overwrite")
-
-na_tokens <- c("NA","N/A","NOT AVAILABLE","NO LONGER AVAILABLE","NO LONGER AVALIABLE","NO LONGER AVAIL.","NOT APPLICABLE","NONE","UNKNOWN")
-norm_id <- function(x){ x <- toupper(trimws(x)); x[x %in% na_tokens] <- NA_character_; x }
-
-id_cols <- c(
-  "UNIQUE ENTITY ID","DUNS NUMBER","CAGE CODE","LEGAL BUSINESS NAME",
-  "PHYSICAL ADDRESS LINE 1","PHYSICAL ADDRESS CITY","PHYSICAL ADDRESS PROVINCE OR STATE",
-  "PHYSICAL ADDRESS COUNTRY CODE","PHYSICAL ADDRESS ZIP/POSTAL CODE",
-  "PRIMARY NAICS","NAICS CODE STRING","PSC CODE STRING","SNAPSHOT","SOURCE"
+plan(multisession, workers = max(2L, parallel::detectCores() - 1L))
+future_walk(
+  files_dat,
+  ~ parse_write_arrow(.x, headers = hdr_public, out_dir = out_parquet),
+  .options = furrr_options(packages = c("stringr","arrow","lubridate"))
 )
 
-tbl <- arrow::open_dataset(out_all) |>
-  select(any_of(id_cols)) |>
-  collect()
+
+```
 
 
-try <- tbl %>% 
-  sample_n(80)
+```{r}
 
-glimpse(tbl)
 
-tbl <- tbl |>
+Sys.setenv(ARROW_NUM_THREADS = as.character(max(1L, parallel::detectCores() - 1L)))
+
+src_dir <- here::here("Data","SAM_ER","Input","parquet_public_v3")
+ds <- arrow::open_dataset(src_dir)
+
+core <- ds %>%
+  select(
+    `UNIQUE ENTITY ID`,
+    `PRIMARY NAICS`, `NAICS CODE STRING`, `PSC CODE STRING`,
+    SOURCE, SNAPSHOT
+  ) %>%
+  collect() %>%
   mutate(
-    UEI  = norm_id(`UNIQUE ENTITY ID`),
-    CAGE = norm_id(`CAGE CODE`),
-    LBN  = toupper(trimws(`LEGAL BUSINESS NAME`)),
-    K_ADDR = paste0(
-      toupper(trimws(`PHYSICAL ADDRESS LINE 1`)),"|",
-      toupper(trimws(`PHYSICAL ADDRESS CITY`)),"|",
-      toupper(trimws(`PHYSICAL ADDRESS PROVINCE OR STATE`)),"|",
-      toupper(trimws(`PHYSICAL ADDRESS COUNTRY CODE`)),"|",
-      toupper(trimws(`PHYSICAL ADDRESS ZIP/POSTAL CODE`))
-    ),
-    FALLBACK = ifelse(!is.na(CAGE) & !is.na(LBN), paste0(CAGE,"|",LBN),
-                      ifelse(!is.na(LBN) & !is.na(K_ADDR), paste0(LBN,"|",K_ADDR), NA_character_)),
-    ENTITY_KEY = coalesce(UEI, FALLBACK)
-  ) |>
-  filter(!is.na(ENTITY_KEY))
+    FILE_SNAPSHOT_D = ymd(SNAPSHOT)  # from partition column, not filename
+  )
 
-xwalk_duns_uei <- tbl |>
-  filter(!is.na(UEI), !is.na(DUNS)) |>
-  arrange(DUNS, desc(SNAPSHOT)) |>
-  distinct(DUNS, UEI, .keep_all = FALSE)
+core <- core[!is.na(core$FILE_SNAPSHOT_D), ]
 
-tbl_bf <- tbl |>
-  left_join(xwalk_duns_uei, by = "DUNS", multiple = "any") |>
-  mutate(UEI_BF = coalesce(UEI, UEI.y)) |>
-  select(-UEI.y)
+clean_naics_token <- function(x){
+  x <- gsub("[^0-9]", "", toupper(x))
+  x[nchar(x) < 2 | nchar(x) > 6] <- NA_character_
+  x
+}
+parse_naics_pair <- function(primary, strvec){
+  p <- clean_naics_token(primary)
+  toks <- strsplit(paste0(strvec %||% "", collapse="~"), "~", fixed = TRUE)[[1]]
+  toks <- clean_naics_token(toks)
+  unique(na.omit(c(p, toks)))
+}
+parse_psc <- function(psc_str){
+  toks <- strsplit(psc_str %||% "", "~", fixed = TRUE)[[1]]
+  toks <- toupper(trimws(toks))
+  toks[!grepl("^[A-Z0-9]{4}$", toks)] <- NA_character_
+  unique(na.omit(toks))
+}
+pick_primary6 <- function(naics_vec){
+  if (length(naics_vec) == 0) return(NA_character_)
+  six <- naics_vec[nchar(naics_vec) == 6]
+  if (length(six)) return(six[1])
+  naics_vec[which.max(nchar(naics_vec))]
+}
 
-latest_by_entity <- tbl_bf |>
-  group_by(ENTITY_KEY) |>
-  summarize(SNAPSHOT = max(SNAPSHOT, na.rm = TRUE), .groups = "drop")
+chunk_size <- 5e5
+core$.chunk <- ceiling(seq_len(nrow(core)) / chunk_size)
+process_chunk <- function(df){
+  NAICS_list <- map2(df$`PRIMARY NAICS`, df$`NAICS CODE STRING`, parse_naics_pair)
+  PSC_list   <- map(df$`PSC CODE STRING`, parse_psc)
+  NAICS_primary_6 <- map_chr(NAICS_list, pick_primary6)
+  PRIMARY_NAICS_nonmiss <- !is.na(clean_naics_token(df$`PRIMARY NAICS`))
+  PSC_count <- map_int(PSC_list, length)
+  df$NAICS_list <- NAICS_list
+  df$PSC_list <- PSC_list
+  df$NAICS_primary_6 <- NAICS_primary_6
+  df$PRIMARY_NAICS_nonmiss <- PRIMARY_NAICS_nonmiss
+  df$PSC_count <- PSC_count
+  df
+}
+chunks <- split(core, core$.chunk)
+results <- future_map(chunks, process_chunk, .options = furrr_options(seed = TRUE))
+core2 <- list_rbind(results)
+core2$.chunk <- NULL
 
-latest_rows <- tbl_bf |>
-  inner_join(latest_by_entity, by = c("ENTITY_KEY","SNAPSHOT"))
 
-if (dir.exists(out_latest)) unlink(out_latest, recursive = TRUE)
-arrow::write_parquet(latest_rows, file.path(out_latest, "latest_entity.parquet"))
+latest_rows <- core2 %>%
+  rename(UEI = `UNIQUE ENTITY ID`) %>%
+  group_by(UEI) %>%
+  arrange(desc(PRIMARY_NAICS_nonmiss),    # prefer rows that have a NAICS
+          desc(FILE_SNAPSHOT_D),          # then take the newest among those
+          desc(PSC_count)) %>%            # richer PSCs as final tiebreaker
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  transmute(
+    UEI,
+    NAICS_primary_6,
+    NAICS_list,
+    PSC_list,
+    SNAPSHOT_used = FILE_SNAPSHOT_D
+  )
 
-lookup <- latest_rows |>
-  select(any_of(c("ENTITY_KEY","UEI_BF","DUNS","CAGE","LEGAL BUSINESS NAME","PRIMARY NAICS","NAICS CODE STRING","PSC CODE STRING","SNAPSHOT"))) |>
-  distinct()
 
-if (dir.exists(out_lookup)) unlink(out_lookup, recursive = TRUE)
-lookup |>
-  group_by(SNAPSHOT) |>
-  write_dataset(out_lookup, format = "parquet", existing_data_behavior = "overwrite")
+arrow::write_parquet(latest_rows, file.path(out_outputs, "uei_join.parquet"))
+saveRDS(latest_rows, file.path(out_outputs, "uei_join.rds"))
 
+subcontracts <- subcontracts %>%
+  left_join(
+    latest_rows %>% transmute(UEI, sub_NAICS = NAICS_primary_6, UEI_PSCs = PSC_list),
+    by = c("sub_id" = "UEI")
+  )
+
+saveRDS(subcontracts, file.path(out_outputs, "subcontracts_with_uei_naics.rds"))
 
 
 ```
 
+
 ```{r}
+
+
+if (!exists("out_priors")) out_priors <- here("Data","SAM_ER","Priors")
+dir.create(out_priors, recursive = TRUE, showWarnings = FALSE)
+
+k_top      <- 10
+min_pair_n <- 3
+
+build_priors <- function(core_df, naics_col, out_prefix) {
+  prior <- core_df %>%
+    filter(!is.na({{naics_col}})) %>%
+    transmute(NAICS = {{naics_col}}, PSC_list) %>%
+    unnest(PSC_list) %>%
+    filter(!is.na(PSC_list)) %>%
+    count(NAICS, PSC = PSC_list, name = "n") %>%
+    group_by(NAICS) %>%
+    mutate(prob = n / sum(n), total_pairs = sum(n), n_psc = n()) %>%
+    ungroup() %>%
+    filter(n >= min_pair_n) %>%
+    group_by(NAICS) %>%
+    mutate(prob = n / sum(n)) %>%
+    ungroup()
+
+  topk <- prior %>%
+    group_by(NAICS) %>%
+    arrange(desc(prob), desc(n)) %>%
+    mutate(rank = row_number(), cumprob = cumsum(prob)) %>%
+    slice_head(n = k_top) %>%
+    ungroup()
+
+  coverage <- topk %>%
+    group_by(NAICS) %>%
+    summarise(topk_mass = sum(prob), n_psc_total = max(n_psc), .groups = "drop")
+
+  summary <- prior %>%
+    group_by(NAICS) %>%
+    summarise(top1 = max(prob),
+              top3 = sum(sort(prob, decreasing = TRUE)[seq_len(min(3, n()))]),
+              entropy = -sum(prob * log(pmax(prob, 1e-12))),
+              n_psc = n(),
+              .groups = "drop")
+
+  saveRDS(prior,    file.path(out_priors, paste0(out_prefix, "_prior.rds")))
+  saveRDS(topk,     file.path(out_priors, paste0(out_prefix, "_topk.rds")))
+  saveRDS(coverage, file.path(out_priors, paste0(out_prefix, "_topk_coverage.rds")))
+  saveRDS(summary,  file.path(out_priors, paste0(out_prefix, "_summary.rds")))
+
+  list(prior = prior, topk = topk, coverage = coverage, summary = summary)
+}
+
+priors6 <- build_priors(core2, NAICS_primary_6, "naics6_psc")
+
+core2_naics4 <- core2 %>%
+  mutate(NAICS4 = if_else(!is.na(NAICS_primary_6), substr(NAICS_primary_6, 1, 4), NA_character_))
+
+priors4 <- build_priors(core2_naics4, NAICS4, "naics4_psc")
+
+saveRDS(list(naics6 = priors6, naics4 = priors4),
+        file.path(out_priors, "naics_psc_priors_all.rds"))
+
+
+```
+
+
+```{r}
+
+p6_top1 <- ggplot(priors6$summary, aes(top1)) +
+  geom_histogram(bins = 40) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Top-1 P(PSC|NAICS6), equal-weighted across NAICS6",
+       x = "Max probability within NAICS6", y = "Number of NAICS6") +
+  theme_minimal()
+
+p6_top3 <- ggplot(priors6$summary, aes(top3)) +
+  geom_histogram(bins = 40) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Cumulative mass of top-3 PSCs per NAICS6",
+       x = "Top-3 cumulative probability", y = "Number of NAICS6") +
+  theme_minimal()
+
+p4_top1 <- ggplot(priors4$summary, aes(top1)) +
+  geom_histogram(bins = 40) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Top-1 P(PSC|NAICS4), equal-weighted across NAICS4",
+       x = "Max probability within NAICS4", y = "Number of NAICS4") +
+  theme_minimal()
+
+p4_top3 <- ggplot(priors4$summary, aes(top3)) +
+  geom_histogram(bins = 40) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Cumulative mass of top-3 PSCs per NAICS4",
+       x = "Top-3 cumulative probability", y = "Number of NAICS4") +
+  theme_minimal()
+
+print(p6_top1)
+print(p6_top3)
+print(p4_top1)
+print(p4_top3)
+
+
+```
+
+
+```{r}
+
+subcontracts %>% 
+  mutate(year_sub = year(date(sub_date))) %>% 
+  group_by(year_sub) %>% 
+  summarise( 
+    nas = mean(is.na(sub_NAICS))
+    ) %>% 
+  ggplot(aes(x = year_sub, y = nas)) + 
+  geom_line() + 
+  scale_y_continuous(limits = c(0, 1)) + 
+  theme_minimal()
+
+
+nas <- subcontracts %>% 
+  mutate(nas = is.na(sub_NAICS)) %>% 
+  group_by(sub_id) %>% 
+  slice_head() %>% 
+  select(sub_id, nas) 
+ 
+mean(nas$nas)
+table(nas$nas)
+
+no_naics <- subcontracts %>% 
+  filter(is.na(sub_NAICS)==T) %>% 
+  distinct(sub_id)
+
+
 
 ```
 
