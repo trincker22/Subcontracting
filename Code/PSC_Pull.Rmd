@@ -5,6 +5,8 @@ date: "2025-09-04"
 ---
 
 ```{r setup, include=FALSE}
+
+
 library(data.table)
 library(digest)
 library(dplyr)
@@ -14,106 +16,273 @@ library(httr2)
 library(jsonlite)
 library(purrr)
 library(readr)
+library(quanteda)
 library(readxl)
 library(stringdist)
 library(stringr)
 library(tibble)
 library(tidyr)
 library(tidytext)
+library(spacyr)
+library(stringi)
+library(ggplot2)
+library(scales)
 
 options(scipen = 999)
-stop_words <- tidytext::stop_words
-`%||%` <- function(a, b) { if (is.null(a) || (is.atomic(a) && length(a) == 1 && is.na(a))) b else a }
+`%||%` <- function(a,b) if (is.null(a) || (is.atomic(a) && length(a)==1 && is.na(a))) b else a
+options(mc.cores = 7)
+
+
 
 ```
 
 
 ```{r}
 
-make_psc_query <- function(df,
-                           subawardee_col = "subawardee_name",
-                           raw_desc_col   = "subaward_description",
-                           expanded_col   = "expanded_description",
-                           max_chars      = 250) {
+to_sentence_case <- function(x){ x2 <- str_to_lower(x); gsub("(^|[\\.\\!\\?]\\s+)([a-z])","\\1\\U\\2",x2,perl=TRUE) }
+collapse_phrase_acronym_echo <- function(x){ x <- gsub("\\b([A-Za-z][A-Za-z\\s]{2,}?)(\\s*\\(([A-Z]{2,6})\\))","\\1",x,perl=TRUE); gsub("\\b([A-Z]{2,6})\\s*\\(\\1\\)","\\1",x,perl=TRUE) }
+strip_admin_tails <- function(x){ x <- gsub("\\b(PERIOD OF PERFORMANCE|PRIME CONTRACT NO\\.|SUBCONTRACT NO\\.|MODIFICATION NO\\.)\\b[^\\.;\\n]*","",x,perl=TRUE); gsub("\\b(FUNDED BY|REQUESTED BY)\\b[^\\.;\\n]*","",x,perl=TRUE) }
+drop_serials_ids_dates <- function(x){ x <- gsub("\\b[A-Z]{2,}\\d[\\w\\-\\.]{4,}\\b","",x,perl=TRUE); x <- gsub("\\b\\d{4}\\b","",x,perl=TRUE); x <- gsub("\\b(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\\s+\\d{1,2},?\\s*\\d{4}\\b","",x,perl=TRUE); gsub("\\bfrom\\s+[^\\s]+\\s+to\\s+[^\\s]+","",x,ignore.case=TRUE,perl=TRUE) }
+dedup_ngrams <- function(x){ w <- unlist(strsplit(x,"\\s+")); if (length(w)<6) return(str_squish(x)); res <- w[1]; for(i in 2:length(w)){ prev5 <- tail(res,5); cand <- w[i]; if (length(prev5) && tail(prev5,1)==cand) next; res <- c(res,cand) }; str_squish(paste(res,collapse=" ")) }
+preclean_text <- function(x){ x %>% to_sentence_case() %>% collapse_phrase_acronym_echo() %>% strip_admin_tails() %>% drop_serials_ids_dates() %>% dedup_ngrams() %>% str_squish() }
+split_to_units <- function(text){ s <- unlist(stringi::stri_split_boundaries(text,type="sentence"),use.names=FALSE); s <- s[nzchar(s)]; s <- vapply(s, preclean_text, character(1)); unique(s[nzchar(s)]) }
 
-  desc_col <- if (expanded_col %in% names(df)) expanded_col else raw_desc_col
+```
 
-  base <- df %>%
-    mutate(
-      .doc_id     = row_number(),
-      .subawardee = coalesce(as.character(.data[[subawardee_col]]), ""),
-      .desc       = coalesce(as.character(.data[[desc_col]]), "")
-    ) %>%
-    mutate(.desc = str_squish(.desc))
 
-  sent_df <- base %>%
-    mutate(.sent_list = str_split(.desc, boundary("sentence"))) %>%
-    select(.doc_id, .subawardee, .sent_list) %>%
-    unnest_longer(.sent_list, values_to = ".sentence", keep_empty = TRUE) %>%
-    mutate(.sentence = str_squish(.sentence))
+```{r}
 
-  word_df <- sent_df %>%
-    filter(nchar(.sentence) > 0) %>%
-    tidytext::unnest_tokens(word, .sentence, token = "words", drop = FALSE) %>%
-    filter(!word %in% tidytext::stop_words$word, !str_detect(word, "^[0-9]+$"))
 
-  doc_term <- word_df %>%
-    count(.doc_id, word, name = "n") %>%
-    bind_tf_idf(word, .doc_id, n) %>%
-    select(.doc_id, word, tf_idf)
 
-  sent_scores <- word_df %>%
-    left_join(doc_term, by = c(".doc_id","word")) %>%
-    group_by(.doc_id, .sentence) %>%
-    summarise(score = sum(tf_idf, na.rm = TRUE), .groups = "drop")
-
-  best_text <- sent_df %>%
-    left_join(sent_scores, by = c(".doc_id", ".sentence")) %>%
-    mutate(score = coalesce(score, 0)) %>%
-    group_by(.doc_id) %>%
-    arrange(desc(score), .sentence, .by_group = TRUE) %>%
-    summarise(
-      .sent_ranked = list(.sentence[nchar(.sentence) > 0]),
-      .subawardee  = first(.subawardee),
-      .groups = "drop"
-    ) %>%
-    rowwise() %>%
-    mutate(
-      .prefix = ifelse(nchar(.subawardee) > 0, paste0(.subawardee, ": "), ""),
-      .room   = max(0L, max_chars - nchar(.prefix)),
-      .best   = {
-        acc <- character(0); used <- 0L
-        for (s in .sent_ranked) {
-          s2  <- str_squish(s)
-          add <- ifelse(length(acc) > 0, 1L, 0L) + nchar(s2)
-          if (used + add > .room) break
-          acc  <- c(acc, s2)
-          used <- used + add
-        }
-        if (!length(acc) && length(.sent_ranked) > 0) substr(.sent_ranked[1], 1L, .room) else paste(acc, collapse = " ")
-      },
-      psc_query_250 = str_squish(substr(paste0(.prefix, .best), 1L, max_chars))
-    ) %>%
-    ungroup() %>%
-    select(.doc_id, psc_query_250)
-
-  fallback <- base %>%
-    mutate(
-      .pref         = ifelse(nchar(.subawardee) > 0, paste0(.subawardee, ": "), ""),
-      fallback_text = str_squish(substr(paste0(.pref, .desc), 1L, max_chars))
-    ) %>%
-    select(.doc_id, fallback_text)
-
-  final <- best_text %>%
-    left_join(fallback, by = ".doc_id") %>%
-    mutate(psc_query_250 = ifelse(!nzchar(psc_query_250), fallback_text, psc_query_250)) %>%
-    select(.doc_id, psc_query_250)
-
-  df %>%
-    mutate(.doc_id = row_number()) %>%
-    left_join(final, by = ".doc_id") %>%
-    select(-.doc_id)
+build_global_idf <- function(text_vec){
+  text_vec <- as.character(text_vec); text_vec[is.na(text_vec)] <- ""
+  text_vec <- vapply(text_vec, preclean_text, character(1))
+  toks <- tokens(text_vec, remove_punct=TRUE, remove_numbers=TRUE)
+  toks <- tokens_tolower(toks)
+  toks <- tokens_remove(toks, stopwords("en"))
+  dfm  <- dfm(toks)
+  N    <- ndoc(dfm); df <- Matrix::colSums(dfm>0)
+  idf  <- log((N+1)/(df+1))
+  structure(as.numeric(idf), names = featnames(dfm))
 }
+idf_path <- here("Data","TF_IDF","idf_vocab.rds")
+if (!fs::file_exists(idf_path)) { idf_vocab <- build_global_idf(subcontracts$expanded_description); fs::dir_create(fs::path_dir(idf_path)); saveRDS(idf_vocab,idf_path) }
+idf_vocab <- readRDS(idf_path)
+
+
+
+```
+
+
+```{r}
+
+
+admin_penalty_vec <- function(x){
+  nchar_x <- nchar(x)
+  up_ratio <- ifelse(nchar_x>0, vapply(strsplit(x,""), function(cs) sum(cs %in% LETTERS), numeric(1))/nchar_x, 0)
+  dig_sym  <- str_count(x,"[0-9]")+str_count(x,"[-_/\\.]")
+  dates    <- str_count(x,"\\b(19|20)\\d{2}\\b|\\bjan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec\\b")
+  id_like  <- str_count(x,"\\b[A-Z]{2,}\\d[\\w\\-]{3,}\\b")
+  enum_p   <- str_count(x,",")+str_count(x,";")
+  0.6*pmin(up_ratio,1)+0.1*pmin(dig_sym/6,1)+0.1*pmin(dates,3)/3+0.1*pmin(id_like,3)/3+0.1*pmin(enum_p,5)/5
+}
+verbiness_spacy <- function(sents){
+  parsed <- spacy_parse(sents, pos=TRUE, tag=FALSE, entity=FALSE, dependency=FALSE)
+  if (!nrow(parsed)) return(rep(0,length(sents)))
+  agg <- parsed |> group_by(doc_id) |> summarise(n_verbs=sum(pos=="VERB",na.rm=TRUE), n_toks=n(), has_obj=any(lag(pos)=="VERB" & pos=="NOUN",na.rm=TRUE), .groups="drop")
+  score <- (agg$n_verbs/pmax(agg$n_toks,1))+ifelse(agg$has_obj,0.3,0)
+  order_ids <- as.character(seq_along(sents)); idx <- match(order_ids, agg$doc_id)
+  res <- numeric(length(sents)); res[!is.na(idx)] <- score[idx[!is.na(idx)]]; res
+}
+tfidf_sentences <- function(sents, idf_vocab){
+  toks <- tokens(sents, remove_punct=TRUE, remove_numbers=TRUE)
+  toks <- tokens_tolower(toks)
+  toks <- tokens_remove(toks, stopwords("en"))
+  dfm_s <- dfm(toks); feats <- featnames(dfm_s)
+  common <- intersect(feats, names(idf_vocab)); if (!length(common)) return(rep(0,nrow(dfm_s)))
+  dfm_s <- dfm_s[, common, drop=FALSE]; as.numeric(dfm_s %*% idf_vocab[common])
+}
+assemble_ranked <- function(sentences, scores, max_chars=250, max_units=3){
+  if (!length(sentences)) return("")
+  ord <- order(scores, decreasing=TRUE); selected <- character(0); used <- 0L
+  for (i in ord){ cand <- sentences[i]; if (!nzchar(cand)) next; add <- ifelse(length(selected)>0,1L,0L)+nchar(cand); if (used+add>max_chars) next; selected <- c(selected,cand); used <- used+add; if (length(selected)>=max_units || used>=max_chars-1L) break }
+  if (!length(selected)) { longest <- sentences[which.max(nchar(sentences))]; return(str_squish(substr(longest,1L,max_chars))) }
+  str_squish(substr(paste(selected,collapse=" "),1L,max_chars))
+}
+
+
+```
+
+```{r}
+split_sentences_df <- function(text_vec){
+  text_vec <- vapply(text_vec, preclean_text, character(1))
+  ss <- stringi::stri_split_boundaries(text_vec, type="sentence")
+  row_id <- rep(seq_along(ss), lengths(ss))
+  sentences <- unlist(ss, use.names=FALSE)
+  keep <- nzchar(sentences)
+  data.frame(row_id=row_id[keep], sentence=vapply(sentences[keep], preclean_text, character(1)), stringsAsFactors=FALSE)
+}
+make_psc_query_fast <- function(df, subawardee_col="subawardee_name", expanded_col="expanded_description", max_chars=250, idf_vocab=get("idf_vocab", envir=.GlobalEnv, inherits=TRUE)){
+  desc <- tidyr::replace_na(as.character(df[[expanded_col]]), "")
+  suba <- tidyr::replace_na(as.character(df[[subawardee_col]]), "")
+  desc_clean <- vapply(desc, preclean_text, character(1))
+  prefixes <- ifelse(nzchar(suba), paste0(suba, ": "), ""); rooms <- pmax(0L, max_chars - nchar(prefixes))
+  sent_df <- split_sentences_df(desc)
+  if (!nrow(sent_df)) return(mutate(df, psc_query_250=str_squish(substr(paste0(prefixes,desc_clean),1L,max_chars))))
+  vscore <- verbiness_spacy(sent_df$sentence)
+  apen   <- admin_penalty_vec(sent_df$sentence)
+  len    <- nchar(sent_df$sentence); lbon <- scales::rescale(pmax(0, pmin(len,160)-40), to=c(0,0.15))
+  tfidf  <- tfidf_sentences(sent_df$sentence, idf_vocab)
+  sent_df$score <- 0.8*tfidf + 1.0*vscore - 0.7*apen + 0.3*lbon
+  row_splits <- split(seq_len(nrow(sent_df)), sent_df$row_id)
+  assemble_row <- function(j){ ix <- row_splits[[j]]; assembled <- assemble_ranked(sent_df$sentence[ix], sent_df$score[ix], max_chars=rooms[j], max_units=3); if (!nzchar(assembled)) str_squish(substr(desc_clean[j],1L,rooms[j])) else assembled }
+  assembled <- vapply(seq_along(row_splits), assemble_row, character(1))
+  out <- str_squish(substr(paste0(prefixes,assembled),1L,max_chars))
+  mutate(df, psc_query_250=out)
+}
+
+
+```
+
+
+```{r}
+test <- make_psc_query_fast(test)
+test <- subcontracts_expanded[1:200,]
+test <- make_psc_query(test)
+
+out <- test %>% 
+  select(expanded_description, psc_query_250) %>%  
+  mutate(nch = nchar(psc_query_250)) %>% 
+  filter(nch >=245) %>% 
+  head(50)
+
+write.csv(out, "out.csv")
+
+
+
+```
+
+
+```{r}
+
+FSCPSC_API  <- "https://api.fscpsc.com/searches"
+FSCPSC_MIME <- "application/vnd.api+json"
+
+parse_fscpsc_jsonapi <- function(jj){
+  inc <- jj$included %||% list()
+  items <- inc[vapply(inc, function(x) is.list(x) && identical(x$type,"product-service-codes"), logical(1))]
+  if (!length(items)) return(tibble(code=character(),name=character(),score=double()))
+  rows <- lapply(items, function(x){
+    code <- toupper(as.character(x$id %||% x$attributes$id %||% ""))
+    name <- as.character(x$attributes$name %||% x$attributes$title %||% x$attributes$`full-name` %||% NA_character_)
+    tibble(code=code, name=name)
+  }) |> bind_rows() |> filter(nchar(code)==4) |> distinct(code, .keep_all=TRUE)
+  rel_a <- {
+    rel <- jj$data$relationships[["product-service-codes"]]
+    if (!is.list(rel)) tibble(code=character(),score=double()) else {
+      dat <- rel$data %||% list()
+      if (!length(dat)) tibble(code=character(),score=double()) else bind_rows(lapply(dat, function(x){
+        meta <- x$meta %||% list(); assoc <- if (!is.null(meta$association)) suppressWarnings(as.numeric(meta$association)) else NA_real_
+        tibble(code=toupper(as.character(x$id %||% "")), score=assoc)
+      })) |> distinct(code,.keep_all=TRUE)
+    }
+  }
+  rel_b <- {
+    if (!length(items)) tibble(code=character(),score=double()) else bind_rows(lapply(items, function(x){
+      rel  <- x$relationships$searches; if (!is.list(rel)) return(tibble(code=character(),score=double()))
+      dat  <- rel$data %||% list(); if (!length(dat)) return(tibble(code=character(),score=double()))
+      m    <- dat[[1]]$meta %||% list(); assoc <- if (!is.null(m$association)) suppressWarnings(as.numeric(m$association)) else NA_real_
+      tibble(code=toupper(as.character(x$id %||% "")), score=assoc)
+    })) |> distinct(code,.keep_all=TRUE)
+  }
+  smap <- full_join(rel_a, rel_b, by="code", suffix=c("_a","_b")) |> transmute(code, score=coalesce(score_a,score_b))
+  left_join(rows, smap, by="code") |> arrange(desc(score), code)
+}
+
+fscpsc_search_psc <- function(query, top_k=5, timeout_sec=25, max_retries=4){
+  q <- as.character(query %||% ""); if (!nzchar(q)) return(tibble(code=character(),name=character(),score=double(),rank=integer()))
+  attempt <- 0
+  repeat{
+    attempt <- attempt+1
+    req <- request(FSCPSC_API) |>
+      req_url_query(include="product-service-codes") |>
+      req_headers("Accept"=FSCPSC_MIME,"Content-Type"=FSCPSC_MIME) |>
+      req_body_json(list(data=list(type="searches", attributes=list(`search-string`=q))), auto_unbox=TRUE) |>
+      req_timeout(timeout_sec)
+    resp <- try(req_perform(req), silent=TRUE)
+    if (inherits(resp,"httr2_response") && resp_status(resp) %in% c(200,201)){
+      jj <- resp_body_json(resp, simplifyVector=FALSE)
+      out <- parse_fscpsc_jsonapi(jj)
+      if (nrow(out)) out <- out |> mutate(rank=row_number()) |> slice_head(n=top_k)
+      return(out)
+    }
+    if (inherits(resp,"httr2_response") && resp_status(resp)==429){
+      reset <- as.numeric(resp_header(resp,"X-RateLimit-Reset") %||% NA_real_)
+      wait_s <- if (is.finite(reset) && reset>0 && reset<60) reset else min(2^(attempt-1),30)
+      Sys.sleep(wait_s + runif(1,0,0.5))
+    } else {
+      if (attempt>=max_retries) return(tibble(code=character(),name=character(),score=double(),rank=integer()))
+      Sys.sleep(min(2^(attempt-1),8)+runif(1,0,0.2))
+    }
+  }
+}
+
+run_fscpsc_psc <- function(df_with_keys, key_cols, query_col="psc_query_250", top_k=5, batch_size=60, pause_between=2.0, per_call_sleep=0.8, fetch_fn=fscpsc_search_psc, outdir=here("runs","psc","outputs"), tag="subset"){
+  cw <- df_with_keys %>% select(.psc_key, all_of(key_cols), !!query_col)
+  uq <- cw %>% distinct(!!sym(query_col)) %>% transmute(psc_query_250 = .data[[query_col]])
+  cache_path <- file.path(outdir, paste0("cache_",tag,".rds"))
+  if (!fs::dir_exists(outdir)) fs::dir_create(outdir, recurse=TRUE)
+  cache <- if (fs::file_exists(cache_path)) readRDS(cache_path) else tibble(psc_query_250=character(), .pred=list())
+  need <- uq %>% anti_join(cache, by="psc_query_250")
+  if (nrow(need)>0){
+    batches <- split(need$psc_query_250, ceiling(seq_along(need$psc_query_250)/batch_size))
+    for (bi in seq_along(batches)){
+      batch <- batches[[bi]]
+      rows <- lapply(batch, function(q){ preds <- fetch_fn(q, top_k=top_k); if (per_call_sleep>0) Sys.sleep(per_call_sleep); tibble(psc_query_250=q, .pred=list(preds)) })
+      cache <- bind_rows(cache, bind_rows(rows)) %>% distinct(psc_query_250, .keep_all=TRUE)
+      saveRDS(cache, cache_path)
+      if (pause_between>0 && bi<length(batches)) Sys.sleep(pause_between)
+    }
+  }
+  preds_long <- cw %>% left_join(cache, by="psc_query_250") %>% unnest(.pred, keep_empty=TRUE) %>%
+    transmute(.psc_key, !!!syms(key_cols), psc_query_250, psc_code=code, psc_name=name, psc_score=score, rank)
+  top1 <- preds_long %>% group_by(.psc_key) %>% arrange(rank, .by_group=TRUE) %>% slice_head(n=1) %>% ungroup()
+  saveRDS(preds_long, file.path(outdir, paste0("preds_topk_",tag,".rds")))
+  saveRDS(top1,      file.path(outdir, paste0("top1_",tag,".rds")))
+  list(preds_topk=preds_long, top1=top1)
+}
+
+
+key_cols <- c("prime_id","sub_id","subaward_number")
+
+idf_path <- here("Data","TF_IDF","idf_vocab.rds")
+if (!fs::file_exists(idf_path)) {
+  idf_vocab <- build_global_idf(subcontracts$expanded_description)
+  fs::dir_create(fs::path_dir(idf_path))
+  saveRDS(idf_vocab, idf_path)
+}
+idf_vocab <- readRDS(idf_path)
+
+subcontracts_q <- make_psc_query_fast(test, subawardee_col="subawardee_name", expanded_col="expanded_description", max_chars=250, idf_vocab=idf_vocab)
+subcontracts_q <- make_psc_keys(subcontracts_q, key_cols=key_cols, query_col="psc_query_250")
+
+saveRDS(subcontracts_q, here("runs","psc","outputs","subcontracts_with_psc_key.rds"))
+
+res <- run_fscpsc_psc(subcontracts_q, key_cols=key_cols, query_col="psc_query_250", top_k=5, batch_size=60, pause_between=2.0, per_call_sleep=0.8, fetch_fn=fscpsc_search_psc, outdir=here("runs","psc","outputs"), tag="subset400")
+
+subcontracts_with_api <- subcontracts_q %>% left_join(res$top1 %>% select(.psc_key, psc_code, psc_name, psc_score), by=".psc_key")
+saveRDS(subcontracts_with_api, here("runs","psc","outputs","subcontracts_with_api_top1.rds"))
+
+preds_joined_back <- subcontracts_q %>% left_join(res$preds_topk, by=c(".psc_key", key_cols, "psc_query_250"))
+saveRDS(preds_joined_back, here("runs","psc","outputs","subcontracts_with_preds_topk_long.rds"))
+
+
+
+```
+
+
+```{r}
+
 
 
 FSCPSC_API  <- "https://api.fscpsc.com/searches"
@@ -331,7 +500,7 @@ run_fscpsc_psc <- function(df,
 
 
 ```
-```
+
 
 
 ```{r}
@@ -348,9 +517,11 @@ sub_q <- make_psc_query(
   max_chars      = 250
 )
 
+
+
 # 2) Stable per-row keys
 key_cols <- c("prime_id","sub_id","subaward_number")
-sub_keys <- make_psc_keys(sub_q, key_cols = key_cols, query_col = "psc_query_250")
+sub_keys <- make_psc_keys(test, key_cols = key_cols, query_col = "psc_query_250")
 
 # 3) Run / reuse cache
 paths <- make_run_paths(here::here("runs","psc"), dataset_tag = "subset400", create = TRUE)
@@ -373,6 +544,33 @@ preds_topk_long <- res$preds_topk %>%
   rename(psc_code = code, psc_name = name, psc_score = score)
 
 
+names(test)
+
+names(subcontracts_with_uei_naics) 
+
+key <- subcontracts_with_uei_naics %>%  
+select(sub_NAICS, sub_id) %>%  
+ group_by(sub_id) %>% 
+ slice_head()
+
+test <- test %>%  
+ left_join(key, join_by(sub_id))
+ 
+ preds <- preds_topk_long %>% 
+ left_join(test %>% 
+ select(psc_query_250, sub_NAICS.x), join_by(psc_query_250))
+ 
+ test_one <- test %>%
+  mutate(NAICS6 = substr(sub_NAICS.x, 1, 6)) %>%
+  count(psc_query_250, NAICS6, sort = TRUE) %>%
+  slice_max(n, by = psc_query_250, with_ties = FALSE) %>%
+  select(psc_query_250, NAICS6)
+
+preds <- preds_topk_long %>%
+  left_join(test_one, by = "psc_query_250")
+
+ 
+
 sub_with_topk_nested <- sub_keys %>%
   left_join(
     preds_topk_long %>%
@@ -388,12 +586,293 @@ safe_write_rds(preds_topk_long,       here::here("runs","psc","outputs","preds_t
 safe_write_rds(sub_with_topk_nested,  here::here("runs","psc","outputs","sub_with_topk_nested_subset400.rds"))
 
 
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+out_priors <- here::here("Data","SAM_ER","Priors")
+
+pri6 <- readRDS(file.path(out_priors,"naics6_psc_prior.rds")) %>%
+  transmute(NAICS6 = NAICS, psc_code = PSC, prior_p = prob)
+
+preds_joined <- preds %>%
+  left_join(pri6, by = c("NAICS6","psc_code")) %>%
+  mutate(prior_p = prior_p %||% 0)
+
+ggplot(preds_joined, aes(x = psc_score, y = prior_p)) +
+  geom_point(alpha = 0.4) +
+  scale_x_continuous(labels = percent) +
+  scale_y_continuous(labels = percent) +
+  labs(x = "API probability", y = "NAICS prior probability") +
+  theme_minimal(base_size = 12)
+
+
+api_top1 <- preds_joined %>%
+  filter(rank == 1) %>%
+  select(.psc_key, api_top1 = psc_code)
+
+prior_top1 <- preds_joined %>%
+  group_by(.psc_key) %>%
+  arrange(desc(prior_p), .by_group = TRUE) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  select(.psc_key, prior_top1 = psc_code)
+
+overlap <- api_top1 %>%
+  inner_join(prior_top1, by = ".psc_key") %>%
+  mutate(agree = api_top1 == prior_top1)
+
+ggplot(overlap, aes(x = agree)) +
+  geom_bar() +
+  labs(x = "API Top-1 == Prior Top-1?", y = "Count") +
+  theme_minimal(base_size = 12)
+  
+  api_top1_with_prior <- preds_joined %>%
+  filter(rank == 1)
+
+ggplot(api_top1_with_prior, aes(x = prior_p)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  scale_x_continuous(labels = percent) +
+  labs(x = "Prior probability of API’s top-1 PSC", y = "Count") +
+  theme_minimal(base_size = 12)
+
+preds_blend <- preds_joined %>%
+  group_by(.psc_key) %>%
+  mutate(
+    prior_p = prior_p %||% 0,
+    api_p   = psc_score,
+    blend_p = 0.7 * api_p + 0.3 * prior_p
+  ) %>%
+  ungroup()
+
+ggplot(preds_blend, aes(x = rank, y = blend_p, color = factor(rank))) +
+  geom_boxplot() +
+  scale_y_continuous(labels = percent) +
+  labs(x = "API Rank", y = "Blend probability") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+
 ```
 
 
 ```{r}
 
 
+names(sub_test)
+look <- sub_test %>% 
+ mutate(nch = nchar(psc_query_250)) %>% 
+ filter(nch >= 245) %>% 
+ select(psc_query_250, expanded_description) %>% 
+ head(200)
+ 
+ write.csv(look,"look.csv")
 
 ```
+
+
+
+```{r}
+
+# Combine with PSC info
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(here)
+library(readr)
+
+# Inputs expected in env:
+# - subcontracts (with prime_id, sub_id, subaward_number, sub_NAICS)
+# - sub_q (from make_psc_query)
+# - preds_topk_long (API predictions: .psc_key, rank, psc_code, psc_name, psc_score)
+# - priors6/priors4 in memory OR saved under out_priors (naics6_psc_prior.rds, naics4_psc_prior.rds)
+
+out_priors <- out_priors %||% here("Data","SAM_ER","Priors")
+
+pri6 <- if (exists("priors6")) priors6$prior else readRDS(file.path(out_priors,"naics6_psc_prior.rds"))
+pri4 <- if (exists("priors4")) priors4$prior else readRDS(file.path(out_priors,"naics4_psc_prior.rds"))
+
+pri6 <- pri6 %>% transmute(NAICS6 = NAICS, psc_code = PSC, prior6_p = prob) %>% group_by(NAICS6) %>% arrange(desc(prior6_p)) %>% mutate(prior6_rank = row_number()) %>% ungroup()
+pri4 <- pri4 %>% transmute(NAICS4 = NAICS, psc_code = PSC, prior4_p = prob) %>% group_by(NAICS4) %>% arrange(desc(prior4_p)) %>% mutate(prior4_rank = row_number()) %>% ungroup()
+
+key_cols <- c("prime_id","sub_id","subaward_number")
+
+
+sub_keys_full <- make_psc_keys(sub_q, key_cols = key_cols, query_col = "psc_query_250") %>%
+  left_join(subcontracts %>% select(all_of(key_cols), sub_NAICS), by = key_cols) %>%
+  mutate(NAICS6 = sub_NAICS, NAICS4 = if_else(nchar(sub_NAICS) >= 4, substr(sub_NAICS,1,4), NA_character_))
+
+api_long <- preds_topk_long %>%
+  group_by(.psc_key) %>%
+  mutate(api_p = if (all(is.na(psc_score))) 0 else pmax(psc_score, 0),
+         api_p = api_p / (sum(api_p, na.rm = TRUE) %||% 1)) %>%
+  ungroup() %>%
+  select(.psc_key, psc_code, psc_name, api_rank = rank, api_p)
+
+row_naics <- sub_keys_full %>% select(.psc_key, NAICS6, NAICS4)
+
+prior_cands6 <- row_naics %>% filter(!is.na(NAICS6)) %>%
+  left_join(pri6 %>% filter(prior6_rank <= 10), by = "NAICS6") %>%
+  select(.psc_key, psc_code, prior6_p)
+
+prior_cands4 <- row_naics %>% filter(is.na(NAICS6) & !is.na(NAICS4)) %>%
+  left_join(pri4 %>% filter(prior4_rank <= 10), by = "NAICS4") %>%
+  select(.psc_key, psc_code, prior4_p)
+
+prior_long <- bind_rows(prior_cands6, prior_cands4) %>%
+  group_by(.psc_key, psc_code) %>%
+  summarise(prior6_p = max(prior6_p %||% NA_real_, na.rm = TRUE),
+            prior4_p = max(prior4_p %||% NA_real_, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(prior_p = coalesce(prior6_p, 0.9 * prior4_p, 0))
+
+cand <- full_join(
+  api_long,
+  prior_long,
+  by = c(".psc_key","psc_code")
+) %>%
+  mutate(psc_name = psc_name %||% NA_character_) %>%
+  group_by(.psc_key) %>%
+  mutate(
+    has_api   = any(!is.na(api_p)),
+    has_prior = any(prior_p > 0),
+    w_api     = case_when(has_api & has_prior ~ 0.7,
+                          has_api & !has_prior ~ 1.0,
+                          !has_api & has_prior ~ 0.0,
+                          TRUE ~ 0.5),
+    w_prior   = 1 - w_api,
+    api_p     = api_p %||% 0,
+    prior_p   = prior_p %||% 0,
+    blend_p   = w_api * api_p + w_prior * prior_p
+  ) %>%
+  ungroup()
+
+combined_ranked <- cand %>%
+  group_by(.psc_key) %>%
+  arrange(desc(blend_p), desc(api_p), .by_group = TRUE) %>%
+  mutate(combined_rank = row_number()) %>%
+  ungroup()
+
+top1_combined <- combined_ranked %>%
+  filter(combined_rank == 1) %>%
+  transmute(.psc_key,
+            psc_code_combined = psc_code,
+            psc_name_combined = psc_name,
+            api_p, prior_p, blend_p)
+
+sub_with_combined_top1 <- sub_keys_full %>%
+  select(.psc_key, all_of(key_cols), psc_query_250, sub_NAICS) %>%
+  left_join(top1_combined, by = ".psc_key")
+
+saveRDS(combined_ranked, here::here("runs","psc","outputs","preds_combined_long.rds"))
+saveRDS(sub_with_combined_top1, here::here("runs","psc","outputs","sub_with_top1_combined.rds"))
+
+
+
+```
+
+```{r}
+
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(here)
+
+# inputs:
+# - preds_topk_subset400: .psc_key, psc_query_250, code, name, score, rank
+# - priors saved at Data/SAM_ER/Priors: naics6_psc_prior.rds, naics4_psc_prior.rds
+# - a map with NAICS per .psc_key (e.g., runs/psc/outputs/sub_with_top1_subset400.rds)
+
+out_priors <- here("Data","SAM_ER","Priors")
+
+pri6 <- readRDS(file.path(out_priors,"naics6_psc_prior.rds")) %>%
+  transmute(NAICS6 = NAICS, psc_code = PSC, prior6_p = prob) %>%
+  group_by(NAICS6) %>% arrange(desc(prior6_p)) %>% mutate(prior6_rank = row_number()) %>% ungroup()
+
+pri4 <- readRDS(file.path(out_priors,"naics4_psc_prior.rds")) %>%
+  transmute(NAICS4 = NAICS, psc_code = PSC, prior4_p = prob) %>%
+  group_by(NAICS4) %>% arrange(desc(prior4_p)) %>% mutate(prior4_rank = row_number()) %>% ungroup()
+
+
+
+sub_keys_like <- readRDS(here("runs","psc","outputs","preds_topk_subset400.rds")) %>%
+  distinct(.psc_key, psc_query_250) %>%
+  left_join()
+  mutate(NAICS6 = sub_NAICS,
+         NAICS4 = if_else(nchar(sub_NAICS) >= 4, substr(sub_NAICS,1,4), NA_character_))
+
+api_long <- preds_topk_subset400 %>%
+  rename(psc_code = code, psc_name = name, api_rank = rank, api_p_raw = score) %>%
+  inner_join(sub_keys_like, by = c(".psc_key","psc_query_250")) %>%
+  group_by(.psc_key) %>%
+  mutate(api_p = {
+    v <- pmax(api_p_raw %||% 0, 0)
+    s <- sum(v, na.rm = TRUE); if (!is.finite(s) || s <= 0) v else v / s
+  }) %>%
+  ungroup() %>%
+  select(.psc_key, psc_query_250, NAICS6, NAICS4, psc_code, psc_name, api_rank, api_p)
+
+prior_cands6 <- api_long %>%
+  filter(!is.na(NAICS6)) %>%
+  select(.psc_key, NAICS6, psc_code) %>%
+  left_join(pri6 %>% filter(prior6_rank <= 10), by = c("NAICS6","psc_code")) %>%
+  select(.psc_key, psc_code, prior6_p)
+
+prior_cands4 <- api_long %>%
+  filter(is.na(NAICS6) & !is.na(NAICS4)) %>%
+  select(.psc_key, NAICS4, psc_code) %>%
+  left_join(pri4 %>% filter(prior4_rank <= 10), by = c("NAICS4","psc_code")) %>%
+  select(.psc_key, psc_code, prior4_p)
+
+prior_long <- bind_rows(prior_cands6, prior_cands4) %>%
+  group_by(.psc_key, psc_code) %>%
+  summarise(prior6_p = max(prior6_p %||% NA_real_, na.rm = TRUE),
+            prior4_p = max(prior4_p %||% NA_real_, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(prior_p = coalesce(prior6_p, 0.9 * prior4_p, 0))
+
+cand <- api_long %>%
+  left_join(prior_long, by = c(".psc_key","psc_code")) %>%
+  group_by(.psc_key) %>%
+  mutate(
+    has_api   = any(!is.na(api_p)),
+    has_prior = any(coalesce(prior_p,0) > 0),
+    w_api     = case_when(has_api & has_prior ~ 0.7,
+                          has_api & !has_prior ~ 1.0,
+                          !has_api & has_prior ~ 0.0,
+                          TRUE ~ 0.5),
+    w_prior   = 1 - w_api,
+    api_p     = api_p %||% 0,
+    prior_p   = prior_p %||% 0,
+    blend_p   = w_api * api_p + w_prior * prior_p
+  ) %>%
+  ungroup()
+
+combined_ranked <- cand %>%
+  group_by(.psc_key) %>%
+  arrange(desc(blend_p), desc(api_p), .by_group = TRUE) %>%
+  mutate(combined_rank = row_number()) %>%
+  ungroup()
+
+top1_combined <- combined_ranked %>%
+  filter(combined_rank == 1) %>%
+  transmute(.psc_key,
+            psc_code_combined = psc_code,
+            psc_name_combined = psc_name,
+            api_p, prior_p, blend_p)
+
+saveRDS(api_long,        here("runs","psc","outputs","api_long_subset400.rds"))
+saveRDS(combined_ranked, here("runs","psc","outputs","preds_combined_long_subset400.rds"))
+saveRDS(top1_combined,   here("runs","psc","outputs","top1_combined_subset400.rds"))
+
+
+
+
+
+```
+
+
 

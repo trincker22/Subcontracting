@@ -56,14 +56,14 @@ Practical knobs: tighten canonicalization via JW\_THRESH in Stage 5. If junk exp
 conflicts_prefer(dplyr::filter)
 
 
-proc_dir <- here("Data", "processed")
-if (!dir_exists(proc_dir)) dir_create(proc_dir, recurse = TRUE)
-
-
-
 ```
 
+
 ```{r}
+
+
+proc_dir <- here("Data", "processed")
+if (!dir_exists(proc_dir)) dir_create(proc_dir, recurse = TRUE)
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
@@ -79,6 +79,26 @@ if (!dir_exists(proc_dir)) dir_create(proc_dir, recurse = TRUE)
     out <- lapply(X, FUN)
   }
   out
+}
+
+
+BANNED_ACR <- toupper(c(
+  "AI","ATE","CARD","CH-","EOD","IT","PA-","UPS","AC","US","TO","CAR","CAP","DR",
+  "FAR","FR","IA","IS","MIS","PI","PO","PROD","RAD","RO","RS","SAG","SAT","SD",
+  "SE","SI","TD","TE","TM"
+))
+
+# hyphen-suffixed entries act as *prefix bans* (e.g., "CH-" will drop CH, CH-47, etc.)
+.is_banned_acr <- function(x) {
+  up <- toupper(as.character(x))
+  exact <- up %in% BANNED_ACR
+  pref_core <- sub("-$", "", BANNED_ACR[grepl("-$", BANNED_ACR)])
+  if (length(pref_core)) {
+    pref_hit <- vapply(up, function(y) any(startsWith(y, pref_core)), logical(1))
+  } else {
+    pref_hit <- rep(FALSE, length(up))
+  }
+  (exact | pref_hit) & !is.na(up) & nzchar(up)
 }
 
 
@@ -223,7 +243,14 @@ stage2_load_dau <- function(in_path = file.path(here("Data","acronymdict.RDS")),
     split_acr <- function(txt) { m <- regexec("^(\\S{2,15})\\s+(.+)$", txt); r <- regmatches(txt, m)[[1]]; if (length(r) == 3) tibble(acr=toupper(trimws(r[2])), exp=trimws(r[3])) else tibble(acr=NA,exp=NA) }
     acr <- bind_rows(lapply(lines, split_acr))
   }
-  acr <- acr %>% filter(!is.na(acr), !is.na(exp), nzchar(acr), nzchar(exp)) %>% mutate(exp = str_split(exp, ";")) %>% unnest(exp) %>% mutate(acr = toupper(str_squish(acr)), exp = str_squish(exp)) %>% filter(nzchar(exp)) %>% distinct(acr, exp)
+  acr <- acr %>%
+    filter(!is.na(acr), !is.na(exp), nzchar(acr), nzchar(exp)) %>% 
+    mutate(exp = str_split(exp, ";")) %>% 
+    unnest(exp) %>% 
+    mutate(acr = toupper(str_squish(acr)), exp = str_squish(exp)) %>% 
+    filter(!.is_banned_acr(acr)) %>% 
+    filter(nzchar(exp)) %>% 
+    distinct(acr, exp)
   meta <- list(stage="stage2_load_dau", created_at=Sys.time(), input_hash=.hash_input(acr))
   .save_rds_meta(acr, out_path, meta)
 }
@@ -259,26 +286,26 @@ stage3_mine_pairs <- function(
   CATALOG    <- c("PN","NSN","CLIN","NIIN","SDRL","FAI","MTBF","BOM","EOL","CAGE","P/N","S/N")
 
 
-  looks_like_acronym <- local({
-    `%IN%` <- `%in%`
-    re_letters <- "^[A-Z][A-Z&\\.\\-]{1,15}$"
-    re_any     <- "^[A-Z0-9][A-Z0-9&\\.\\-]{1,15}$"
-    re_shout   <- "^[A-Z]{6,}$"
-    function(acr) {
-      up <- toupper(as.character(acr))
-      ok <- nzchar(up)
-      ok <- ok & grepl(if (ALLOW_DIGITS) re_any else re_letters, up)
-      ok <- ok & (stringi::stri_count_regex(up, "[A-Z]") >= 2)
-      # length gate: allow short only if explicitly kept
-      ok <- ok & (nchar(up) >= MIN_ACR_LEN | up %IN% KEEP_UPPER)
-     
-      ok <- ok & !(up %IN% STOP_ACR)
-      shout <- grepl(re_shout, up)
-      ok <- ok & (!shout | (up %IN% KEEP_UPPER))
-      ok[is.na(ok)] <- FALSE
-      ok
-    }
-  })
+ looks_like_acronym <- local({
+  `%IN%` <- `%in%`
+  re_shape <- "^[A-Z0-9][A-Z0-9&\\.\\-]{1,9}$"
+  re_shout <- "^[A-Z]{5,}$"
+  function(acr) {
+    up <- toupper(as.character(acr))
+    ok <- rep_len(TRUE, length(up))
+    na <- is.na(up) | up == ""
+    ok[na] <- FALSE
+    ok <- ok & grepl(re_shape, up)
+    ok <- ok & (stringi::stri_count_regex(up, "[A-Z]") >= 2)
+    ok <- ok & !(up %IN% STOP_ACR)
+    ok <- ok & !.is_banned_acr(up)            # <-- ADD THIS LINE
+    shout <- grepl(re_shout, up)
+    ok <- ok & (!shout | .is_banned_acr(up) == FALSE)  # keep long shouts only if not banned
+    ok[is.na(ok)] <- FALSE
+    ok
+  }
+})
+
 
   normalize_phrase <- function(x) {
     x %>% toupper() %>%
@@ -427,36 +454,30 @@ stage3_mine_pairs <- function(
 }
 
 
-
-### Stage 4 
-
-stage4_counts_features <- function(pairs_path = file.path(proc_dir,"hi_conf_pairs.rds"),
-                                   out_dict_raw = file.path(proc_dir,"dict_all_raw.rds"),
-                                   out_feat = file.path(proc_dir,"feat_tbl.rds")) {
-  pairs <- readRDS(pairs_path)
-  dict_all_raw <- pairs %>% mutate(exp = toupper(exp)) %>% dplyr::count(acr, exp, name="freq", sort=FALSE)
-  feat_tbl <- pairs %>% mutate(exp_uc_raw = toupper(exp)) %>% distinct(acr, exp_uc = exp_uc_raw, doc_id, pattern) %>% group_by(acr, exp_uc) %>% summarise(doc_coverage=n_distinct(doc_id), def_hits=sum(pattern %in% c("longform_paren","acr_paren_longform")), .groups="drop")
-  .save_rds_meta(dict_all_raw, out_dict_raw, list(stage="stage4_counts_features", created_at=Sys.time(), input_hash=.hash_input(pairs)))
-  .save_rds_meta(feat_tbl, out_feat, list(stage="stage4_counts_features", created_at=Sys.time(), input_hash=.hash_input(pairs)))
-}
-
-
-
 ### Stage 5 
 
+stage5_union_canon_and_count <- function(
+  pairs_path   = file.path(proc_dir,"hi_conf_pairs.rds"),   # from Stage 3
+  dau_path     = file.path(proc_dir,"acr_dict_dau.rds"),    # from Stage 2
+  out_dict     = file.path(proc_dir,"dict_all.rds"),        # canonical dict with freq
+  out_map      = file.path(proc_dir,"exp_map.rds"),         # raw->canonical map
+  out_feat     = file.path(proc_dir,"feat_tbl.rds"),        # doc_coverage, def_hits (canonical)
+  out_raw      = file.path(proc_dir,"dict_all_raw.rds"),    # optional: raw (acr,exp_raw) counts
+  JW_THRESH    = 0.95,                                      # 0.95–0.97 good
+  block_prefix = 4,                                         # cheap prefix blocking
+  min_freq_mined = 1L,                                      # keep canonical if mined freq ≥1 OR in DAU
+  prefer_dau   = TRUE                                       # prefer DAU wording in a JW cluster
+) {
+  library(dplyr); library(stringr); library(stringdist)
+  library(tibble); library(purrr); library(readr); library(parallel)
 
-
-stage5_canon_jw <- function(dict_raw_path = file.path(proc_dir,"dict_all_raw.rds"),
-                            dau_path = file.path(proc_dir,"acr_dict_dau.rds"),
-                            out_dict = file.path(proc_dir,"dict_all.rds"),
-                            out_map = file.path(proc_dir,"exp_map.rds"),
-                            JW_THRESH = 0.95, block_prefix = 4) {
-  dict_all_raw <- readRDS(dict_raw_path)
-  acr_dict_dau <- if (file.exists(dau_path)) readRDS(dau_path) else tibble(acr=character(),exp=character())
-  ACRONYM_KEEP <- c("DoD","USAF","USN","USMC","USA","AFOTEC","JSF","COTS","F-35","MTBF","BOM","SDRL","NSN","CLIN","NIIN","CAGE","ISR","GPS","RF","IT","AI","UAS","UAV","SATCOM")
+  # ----- helpers -----
   connectors <- c("AND","OR","OF","THE","FOR","IN","ON","WITH","TO","BY","AT","FROM","A","AN","AS")
   strip_leading_trailing_conn <- function(x) {
-    y <- toupper(x); y <- str_replace_all(y, "[ ]*/[ ]*", "/"); y <- str_replace_all(y, "\\s+", " "); y <- str_squish(y)
+    y <- toupper(x)
+    y <- str_replace_all(y, "[ ]*/[ ]*", "/")
+    y <- str_replace_all(y, "\\s+", " ")
+    y <- str_squish(y)
     repeat {
       y2 <- str_replace(y, paste0("^(", paste(connectors, collapse="|"), ")\\s+"), "")
       y2 <- str_replace(y2, paste0("\\s+(", paste(connectors, collapse="|"), ")$"), "")
@@ -470,36 +491,98 @@ stage5_canon_jw <- function(dict_raw_path = file.path(proc_dir,"dict_all_raw.rds
     toks <- str_split(x, "\\s+")[[1]]
     any(nchar(toks) >= 3 | str_detect(toks, "[0-9/\\-]"))
   }
-  dau_uc <- acr_dict_dau %>% transmute(acr=toupper(acr), exp_uc=toupper(exp))
-  dr <- dict_all_raw %>% mutate(exp_uc = strip_leading_trailing_conn(exp)) %>% filter(nzchar(exp_uc)) %>% filter(map_lgl(exp_uc, has_content_token))
-  dr <- dr %>% left_join(dau_uc %>% mutate(dau=1L), by=c("acr","exp_uc")) %>% mutate(dau = coalesce(dau, 0L))
-  rare_ok <- dr %>% group_by(acr, exp_uc) %>% summarise(freq = sum(freq), dau = max(dau), .groups="drop")
-  keep_keys <- rare_ok %>% filter(freq > 1 | dau > 0) %>% transmute(acr, exp_uc) %>% distinct()
-  dr <- dr %>% inner_join(keep_keys, by=c("acr","exp_uc")) %>% group_by(acr, exp_uc) %>% summarise(freq=sum(freq), .groups="drop")
-  dr <- dr %>% mutate(ntok = str_count(exp_uc, "\\S+"),
-                      pref = substr(exp_uc, 1, block_prefix),
-                      bucket = cut(ntok, breaks=c(-Inf,2,4,Inf), labels=c("t12","t34","t5p")))
-  by_acr <- split(dr, dr$acr)
-  worker <- function(df_acr) {
-    df_acr <- df_acr %>% arrange(desc(freq), desc(nchar(exp_uc)))
+  .ban_if_present <- function(df) {
+    if (exists(".is_banned_acr", mode="function")) {
+      dplyr::filter(df, !.is_banned_acr(acr))
+    } else df
+  }
+
+  # ----- inputs -----
+  pairs <- if (file.exists(pairs_path)) readRDS(pairs_path) else
+    tibble(acr=character(), exp=character(), doc_id=integer(), pattern=character())
+  dau   <- if (file.exists(dau_path))  readRDS(dau_path)  else
+    tibble(acr=character(), exp=character())
+
+  # mined (raw) normalization
+  mined_raw <- pairs %>%
+    transmute(
+      acr         = toupper(as.character(acr)),
+      exp_uc_raw  = strip_leading_trailing_conn(as.character(exp)),
+      doc_id      = as.integer(doc_id),
+      pattern     = as.character(pattern)
+    ) %>%
+    filter(nzchar(acr), nzchar(exp_uc_raw))
+
+  # optional: keep a raw count table for debugging/QA
+  dict_all_raw <- mined_raw %>%
+    count(acr, exp_uc_raw, name = "freq", sort = FALSE)
+
+  # DAU normalization
+  dau_norm <- dau %>%
+    transmute(
+      acr   = toupper(as.character(acr)),
+      exp_uc= strip_leading_trailing_conn(as.character(exp)),
+      dau   = 1L
+    ) %>%
+    filter(nzchar(acr), nzchar(exp_uc)) %>%
+    distinct(acr, exp_uc, .keep_all = TRUE)
+
+  # union of expansion strings for JW clustering
+  mined_norm <- mined_raw %>%
+    distinct(acr, exp_uc_raw) %>%
+    transmute(acr, exp_uc = exp_uc_raw, dau = 0L)
+
+  uni <- bind_rows(mined_norm, dau_norm) %>%
+    .ban_if_present() %>%
+    distinct(acr, exp_uc, .keep_all = TRUE) %>%
+    filter(map_lgl(exp_uc, has_content_token))
+
+  if (!nrow(uni)) {
+    # nothing to cluster; write empties but keep shapes consistent
+    .save_rds_meta(tibble(acr=character(), exp_uc=character(), freq=integer()), out_dict,
+                   list(stage="stage5_union_canon_and_count", created_at=Sys.time(), JW_THRESH=JW_THRESH))
+    .save_rds_meta(tibble(acr=character(), exp_uc_raw=character(), exp_uc_canon=character()), out_map,
+                   list(stage="stage5_union_canon_and_count", created_at=Sys.time(), JW_THRESH=JW_THRESH))
+    .save_rds_meta(tibble(acr=character(), exp_uc=character(), doc_coverage=integer(), def_hits=integer()), out_feat,
+                   list(stage="stage5_union_canon_and_count", created_at=Sys.time(), JW_THRESH=JW_THRESH))
+    .save_rds_meta(dict_all_raw, out_raw,
+                   list(stage="stage5_union_canon_and_count", created_at=Sys.time(), kind="raw_counts"))
+    return(invisible(NULL))
+  }
+
+  # blocking for speed
+  uni <- uni %>%
+    mutate(
+      ntok   = str_count(exp_uc, "\\S+"),
+      pref   = substr(exp_uc, 1, block_prefix),
+      bucket = cut(ntok, breaks = c(-Inf,2,4,Inf), labels = c("t12","t34","t5p"))
+    )
+
+  pick_rep <- function(bl) {
+    # prefer DAU wording (if any), then higher support in mined (later), then longer string
+    ord <- order(-bl$dau, -nchar(bl$exp_uc))
+    ord[1]
+  }
+
+  # JW clustering per acronym over the UNION
+  by_acr <- split(uni, uni$acr)
+
+  cluster_one_acr <- function(df_acr) {
     blocks <- split(df_acr, interaction(df_acr$pref, df_acr$bucket, drop=TRUE))
-    dict_list <- list(); map_list <- list()
+    map_list <- list()
+
     for (bl in blocks) {
-      if (nrow(bl) == 0) next
-      ord <- order(-bl$freq, -nchar(bl$exp_uc))
-      bl <- bl[ord, , drop=FALSE]
+      if (!nrow(bl)) next
       n <- nrow(bl)
-      if (n == 1) {
-        dict_list[[length(dict_list)+1]] <- tibble(acr = bl$acr[1], exp_uc = bl$exp_uc[1], freq = bl$freq[1])
-        map_list[[length(map_list)+1]]  <- tibble(acr = bl$acr[1], exp_uc_raw = bl$exp_uc[1], exp_uc_canon = bl$exp_uc[1])
+      if (n == 1L) {
+        map_list[[length(map_list)+1]] <- tibble(acr = bl$acr[1], exp_uc_raw = bl$exp_uc[1], exp_uc_canon = bl$exp_uc[1])
         next
       }
       top_cap <- min(50, n)
       S <- matrix(0, n, n)
       for (i in seq_len(n)) {
         jset <- seq_len(top_cap)
-        jw <- 1 - stringdist(bl$exp_uc[i], bl$exp_uc[jset], method="jw")
-        S[i, jset] <- jw
+        S[i, jset] <- 1 - stringdist(bl$exp_uc[i], bl$exp_uc[jset], method = "jw")
       }
       diag(S) <- 1
       comp <- rep(NA_integer_, n); cid <- 0L
@@ -513,18 +596,63 @@ stage5_canon_jw <- function(dict_raw_path = file.path(proc_dir,"dict_all_raw.rds
       }
       clusters <- split(seq_len(n), comp)
       for (ix in clusters) {
-        pick <- ix[order(-bl$freq[ix], -nchar(bl$exp_uc[ix]))][1]
-        dict_list[[length(dict_list)+1]] <- tibble(acr=bl$acr[pick], exp_uc=bl$exp_uc[pick], freq=sum(bl$freq[ix]))
-        map_list[[length(map_list)+1]]  <- tibble(acr=bl$acr[ix], exp_uc_raw=bl$exp_uc[ix], exp_uc_canon=bl$exp_uc[pick])
+        blc <- bl[ix, , drop=FALSE]
+        pick <- ix[ pick_rep(blc) ]
+        # map all raw variants in the block to the pick
+        map_list[[length(map_list)+1]] <- tibble(
+          acr          = bl$acr[ix],
+          exp_uc_raw   = bl$exp_uc[ix],
+          exp_uc_canon = bl$exp_uc[pick]
+        )
       }
     }
-    list(dict=bind_rows(dict_list), map=bind_rows(map_list))
+    bind_rows(map_list)
   }
-  res <- mclapply(by_acr, worker, mc.cores = 6)
-  dict_all <- bind_rows(lapply(res, `[[`, "dict")) %>% group_by(acr, exp_uc) %>% summarise(freq=sum(freq), .groups="drop")
-  exp_map  <- bind_rows(lapply(res, `[[`, "map"))  %>% distinct(acr, exp_uc_raw, .keep_all=TRUE)
-  .save_rds_meta(dict_all, out_dict, list(stage="stage5_canon_jw", created_at=Sys.time(), JW_THRESH=JW_THRESH, block_prefix=block_prefix))
-  .save_rds_meta(exp_map,  out_map,  list(stage="stage5_canon_jw", created_at=Sys.time(), JW_THRESH=JW_THRESH, block_prefix=block_prefix))
+
+  exp_map <- bind_rows(parallel::mclapply(by_acr, cluster_one_acr, mc.cores = 6L)) %>%
+    distinct(acr, exp_uc_raw, .keep_all = TRUE)
+
+  # ---- aggregate mined counts/features ON CANONICAL KEYS ----
+  mined_canon <- mined_raw %>%
+    left_join(exp_map, by = c("acr","exp_uc_raw")) %>%
+    mutate(exp_uc = coalesce(exp_uc_canon, exp_uc_raw)) %>%
+    filter(nzchar(exp_uc))
+
+  # counts per canonical
+  dict_canon <- mined_canon %>%
+    count(acr, exp_uc, name = "freq", sort = FALSE)
+
+  # features per canonical
+  feat_tbl <- mined_canon %>%
+    mutate(def_hit = pattern %in% c("longform_paren","acr_paren_longform")) %>%
+    distinct(acr, exp_uc, doc_id, def_hit) %>%
+    group_by(acr, exp_uc) %>%
+    summarise(
+      doc_coverage = n_distinct(doc_id),
+      def_hits     = sum(def_hit, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # ensure DAU-only canon rows appear with freq=0
+  canon_universe <- exp_map %>% distinct(acr, exp_uc = exp_uc_canon)
+  dict_all <- canon_universe %>%
+    left_join(dict_canon, by = c("acr","exp_uc")) %>%
+    mutate(freq = coalesce(freq, 0L))
+
+  # save
+  .save_rds_meta(dict_all, out_dict,
+                 list(stage="stage5_union_canon_and_count", created_at=Sys.time(),
+                      JW_THRESH=JW_THRESH, block_prefix=block_prefix,
+                      prefer_dau=prefer_dau, min_freq_mined=min_freq_mined))
+  .save_rds_meta(exp_map,  out_map,
+                 list(stage="stage5_union_canon_and_count", created_at=Sys.time(),
+                      JW_THRESH=JW_THRESH, block_prefix=block_prefix,
+                      prefer_dau=prefer_dau))
+  .save_rds_meta(feat_tbl, out_feat,
+                 list(stage="stage5_union_canon_and_count", created_at=Sys.time()))
+  .save_rds_meta(dict_all_raw, out_raw,
+                 list(stage="stage5_union_canon_and_count", created_at=Sys.time(), kind="raw_counts"))
+  invisible(dict_all)
 }
 
 
@@ -537,7 +665,7 @@ stage6_score_candidates <- function(
   dau_path   = file.path(proc_dir,"acr_dict_dau.rds"),
   out_cand   = file.path(proc_dir,"acr_candidates.rds"),
   out_lex    = file.path(proc_dir,"acr_lexicon.rds"),
-  w_def = 2.5, w_freq = 1.0, w_doc = 0.8, w_auth = 2.0,
+  w_def = 1.7, w_freq = 1.0, w_doc = 0.8, w_auth = 1.5,
   margin = 0.15, topK_per_acr = 2L
 ) {
   library(dplyr); library(stringr); library(tidyr); library(tibble); library(purrr)
@@ -633,10 +761,10 @@ stage6_score_candidates <- function(
     arrange(desc(score), .by_group = TRUE) %>%
     group_by(acr) %>%
     summarise(
-      best        = first(exp_disp),
-      best_uc     = first(exp_uc),
-      confidence  = first(score),
-      best_prior  = first(prior),
+      best        = dplyr::first(exp_disp),
+      best_uc     = dplyr::first(exp_uc),
+      confidence  = dplyr::first(score),
+      best_prior  = dplyr::first(prior),
       alt         = if (n() >= 2) nth(exp_disp, 2) else NA_character_,
       alt_score   = if (n() >= 2) nth(score, 2) else NA_real_,
       alt_prior   = if (n() >= 2) nth(prior, 2) else NA_real_,
@@ -735,6 +863,8 @@ stage7_embeddings_frozen <- function(
 
 
 ```
+
+
 
 ```{r}
 
@@ -1238,8 +1368,8 @@ stage8_expand <- function(
   invisible(out)
 }
 
-
 ```
+
 
 ```{r}
 
@@ -1369,33 +1499,29 @@ stage8_debug_snapshot <- function(
   )
 }
 
-
-
 ```
 
+
+
 ```{r}
-
-
 .stage_outputs <- list(
   stage1     = c("subcontracts_with_flags.rds"),
   stage2     = c("acr_dict_dau.rds"),
   stage3     = c("hi_conf_pairs.rds"),
-  stage4     = c("dict_all_raw.rds","feat_tbl.rds"),
-  stage5     = c("dict_all.rds","exp_map.rds"),
+  stage5     = c("dict_all.rds","exp_map.rds","feat_tbl.rds","dict_all_raw.rds"),  # <- from new Stage 5
   stage6     = c("acr_candidates.rds","acr_lexicon.rds"),
   stage7     = c("w2v_contracts_matrix.rds","w2v_vocab.rds"),
   stage8_tune= c("expanded_sample_metrics.rds","expanded_sample_preview.rds"),
   stage8_full= c("subcontracts_expanded.rds")
 )
-.stage_order <- c("stage1","stage2","stage3","stage4","stage5","stage6","stage7","stage8_tune","stage8_full")
 
+.stage_order <- c("stage1","stage2","stage3","stage5","stage6","stage7","stage8_tune","stage8_full")
 
 .stage_funcs <- list(
   stage1      = function(...) stage1_clean_flags(subcontracts),
   stage2      = function(...) stage2_load_dau(...),
   stage3      = function(...) stage3_mine_pairs(...),
-  stage4      = function(...) stage4_counts_features(...),
-  stage5      = function(...) stage5_canon_jw(...),
+  stage5      = function(...) stage5_union_canon_and_count(...),  # <-- new
   stage6      = function(...) stage6_score_candidates(...),
   stage7      = function(...) stage7_embeddings_frozen(...),
   stage8_tune = function(...) stage8_expand(mode="tune", ...),
@@ -1446,8 +1572,8 @@ run_from <- function(from = "stage3", thru = "stage7", mode8 = c("none","tune","
   invisible(TRUE)
 }
 
-
 ```
+
 
 ```{r}
 # Run Example 
@@ -1458,12 +1584,15 @@ run_from <- function(from = "stage3", thru = "stage7", mode8 = c("none","tune","
 
 
 reset_from("stage1")
+run_from("stage5", thru = "stage7")
+
+run_expand_tune()
 run_build_once()
 run_expand_full(alpha = 0.8, tau = 0.53, k_window = 12, topK = 2L, workers = 6)
 
-
-
 ```
+
+
 
 ```{r}
 library(tidyverse)
@@ -1487,8 +1616,9 @@ tau_current <- 0.53
 ggplot(curve_df, aes(tau, share_above)) +
   geom_line() +
   geom_vline(xintercept = tau_current, linetype = 2) +
-  labs(title = "Operating curve: share of candidates above τ",
-       x = "τ (gate)", y = "Pr(score > τ)")
+  labs(title = "Share of Candidates Above τ",
+       x = "τ (gate)", y = "Pr(score > τ)") + 
+  theme_minimal()
 
 
 pick_tau_for_share <- function(target_share = 0.05) {
@@ -1527,13 +1657,382 @@ suggest_tau_by_share <- pick_tau_for_share(0.05)         #
 suggest_tau_by_rpk   <- pick_tau_for_repl_per_1k(5)      # 
 
 cat(sprintf("Suggested τ (5%% lines): %.3f\n", suggest_tau_by_share))
-cat(sprintf("Suggested τ (~5 repl/1k): %.3f\n", suggest_tau_by_rpk))
-
-
+cat(sprintf("Suggested τ (~5 repl/1k): %.3f\" ))
 
 
 ```
+
 
 ```{r}
+# ---- Stage 6 Metrics: Visualizations ----
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(scales)
+  library(readr)
+  library(here)
+  library(fs)
+})
+
+visualize_stage6 <- function(
+  proc_dir = here("Data", "processed"),
+  out_dir  = file.path(proc_dir, "figs"),
+  save_png = TRUE, width = 8, height = 5, dpi = 150
+) {
+  cand_path <- file.path(proc_dir, "acr_candidates.rds")
+  stopifnot(file.exists(cand_path))
+  dir_create(out_dir, recurse = TRUE)
+
+  x <- readRDS(cand_path)
+
+  # --- guards: only keep columns that exist
+  need <- c("acr","exp_uc","score_raw","score","prior",
+            "freq","doc_coverage","def_hits","auth_hits","rank")
+  miss <- setdiff(need, names(x))
+  if (length(miss)) message("Note: missing columns -> ", paste(miss, collapse=", "))
+
+  # lightweight cleaning / derived fields
+  x <- x %>%
+    mutate(
+      log_freq      = log1p(freq %||% 0L),
+      def_bucket    = factor(pmin(def_hits %||% 0L, 2), labels = c("0","1","2+")),
+      auth_flag     = (auth_hits %||% 0L) > 0L
+    )
+
+  # 1) Distributions of score/prior
+  p_dist <- x %>%
+    select(score_raw = score_raw, prior = prior, score = score) %>%
+    pivot_longer(everything(), names_to = "metric", values_to = "value") %>%
+    filter(is.finite(value)) %>%
+    ggplot(aes(value, after_stat(density), fill = metric)) +
+    geom_histogram(bins = 50, alpha = 0.65, position = "identity") +
+    facet_wrap(~ metric, ncol = 1, scales = "free_y") +
+    labs(title = "Stage 6: Distributions", x = "Value", y = "Density") +
+    theme_minimal(base_size = 12) + theme(legend.position = "none")
+
+  # 2) Relationship: frequency vs score_raw
+  p_freq <- x %>%
+    filter(is.finite(log_freq), is.finite(score_raw)) %>%
+    ggplot(aes(log_freq, score_raw)) +
+    geom_point(alpha = 0.25, size = 1) +
+    geom_smooth(method = "loess", se = FALSE) +
+    labs(title = "Frequency vs. Raw Score",
+         x = "log1p(freq)", y = "score_raw") +
+    theme_minimal(base_size = 12)
+
+  # 3) Relationship: document coverage vs score_raw
+  p_doc <- x %>%
+    filter(is.finite(doc_coverage), is.finite(score_raw)) %>%
+    ggplot(aes(doc_coverage, score_raw)) +
+    geom_point(alpha = 0.25, size = 1) +
+    geom_smooth(method = "loess", se = FALSE) +
+    labs(title = "Document Coverage vs. Raw Score",
+         x = "Distinct documents (coverage)", y = "score_raw") +
+    theme_minimal(base_size = 12)
+
+  # 4) Definition hits vs score_raw
+  p_def <- x %>%
+    filter(is.finite(score_raw)) %>%
+    ggplot(aes(def_bucket, score_raw, fill = def_bucket)) +
+    geom_violin(trim = TRUE, alpha = 0.6) +
+    geom_boxplot(width = 0.15, outlier.shape = NA) +
+    labs(title = "Definition Hits vs. Raw Score",
+         x = "Definition hits (0/1/2+)", y = "score_raw") +
+    theme_minimal(base_size = 12) + theme(legend.position = "none")
+
+  # 5) Candidate yield per acronym
+  per_acr <- x %>% count(acr, name = "n_cand")
+  p_yield <- per_acr %>%
+    ggplot(aes(n_cand)) +
+    geom_histogram(binwidth = 1, boundary = 0, closed = "left", fill = "grey60") +
+    scale_x_continuous(breaks = pretty_breaks()) +
+    labs(title = "Candidates per Acronym", x = "# candidates per ACR", y = "Count of acronyms") +
+    theme_minimal(base_size = 12)
+
+  # 6) DAU authority share across score deciles
+  p_auth <- x %>%
+    filter(is.finite(score)) %>%
+    mutate(dec = ntile(score, 10)) %>%
+    group_by(dec) %>%
+    summarise(share_auth = mean(auth_flag, na.rm = TRUE), .groups = "drop") %>%
+    ggplot(aes(dec, share_auth)) +
+    geom_col() +
+    scale_y_continuous(labels = percent_format()) +
+    labs(title = "DAU Authority Share by Score Decile",
+         x = "Score decile (within acronym ranking)", y = "Share with DAU hit") +
+    theme_minimal(base_size = 12)
+
+  # 7) Top-vs-runner-up margin (how separable is the best choice?)
+  gaps <- x %>%
+    filter(rank %||% NA_integer_ <= 2L) %>%
+    arrange(acr, rank) %>%
+    group_by(acr) %>%
+    summarise(gap = (score[rank == 1] %||% NA) - (score[rank == 2] %||% NA),
+              .groups = "drop")
+  p_gap <- gaps %>%
+    ggplot(aes(gap)) +
+    geom_histogram(bins = 40, fill = "steelblue") +
+    labs(title = "Top-2 Score Gap per Acronym",
+         x = "score(top1) – score(top2)", y = "Count of acronyms") +
+    theme_minimal(base_size = 12)
+
+  plots <- list(
+    dist = p_dist, freq_vs_score = p_freq, doccov_vs_score = p_doc,
+    defhits_vs_score = p_def, yield_per_acr = p_yield,
+    dau_share_by_decile = p_auth, top2_gap = p_gap
+  )
+
+  if (isTRUE(save_png)) {
+    ggsave(file.path(out_dir, "stage6_dist.png"),            p_dist, width = width, height = height, dpi = dpi)
+    ggsave(file.path(out_dir, "stage6_freq_vs_score.png"),   p_freq, width = width, height = height, dpi = dpi)
+    ggsave(file.path(out_dir, "stage6_doccov_vs_score.png"), p_doc,  width = width, height = height, dpi = dpi)
+    ggsave(file.path(out_dir, "stage6_defhits_vs_score.png"),p_def,  width = width, height = height, dpi = dpi)
+    ggsave(file.path(out_dir, "stage6_yield_per_acr.png"),   p_yield,width = width, height = height, dpi = dpi)
+    ggsave(file.path(out_dir, "stage6_dau_share_decile.png"),p_auth, width = width, height = height, dpi = dpi)
+    ggsave(file.path(out_dir, "stage6_top2_gap.png"),        p_gap,  width = width, height = height, dpi = dpi)
+  }
+
+  # quick textual summary (prints in console)
+  summary_tbl <- tibble::tibble(
+    n_candidates = nrow(x),
+    n_unique_acr = dplyr::n_distinct(x$acr),
+    med_score_raw = median(x$score_raw, na.rm = TRUE),
+    med_prior     = median(x$prior, na.rm = TRUE),
+    med_score     = median(x$score, na.rm = TRUE),
+    auth_share    = mean(x$auth_flag, na.rm = TRUE)
+  )
+  print(summary_tbl)
+
+  invisible(plots)
+}
+
+# Example usage:
+plots <- visualize_stage6()
+# To display in the Rmd, print any plot, e.g.:
+# plots$dist; plots$freq_vs_score; plots$defhits_vs_score
+
+plots$dist
+plots$freq_vs_score
+plots$doccov_vs_score
+plots$defhits_vs_score
+plots$yield_per_acr
+plots$dau_share_by_decile
+plots$top2_gap
+
+
+ lubridate::year(lubridate::date(sub_date))) %>% 
+  group_by(year) %>% 
+  summarise(
+    mean_junky = mean(flag_junky), 
+    mean_serial = mean(flag_serial), 
+    mean_short = mean(flag_short)
+  ) %>%  
+  ggplot(aes(x = year)) + 
+  geom_line(aes( y = mean_junky))
+  
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(scales)
+
+subcontracts_with_flags %>%
+  mutate(year = lubridate::year(lubridate::as_date(sub_date))) %>% 
+  group_by(year) %>% 
+  summarise(
+    mean_junky  = mean(flag_junky,  na.rm = TRUE), 
+    mean_serial = mean(flag_serial, na.rm = TRUE), 
+    mean_short  = mean(flag_short,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%  
+  pivot_longer(starts_with("mean_"), names_to = "flag", values_to = "share") %>%
+  mutate(flag = recode(flag,
+                       mean_junky  = "Junky",
+                       mean_serial = "Serial-like",
+                       mean_short  = "Short")) %>%
+  ggplot(aes(x = year, y = share, color = flag)) + 
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.6) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = pretty_breaks()) +
+  labs(title = "Share of rows flagged by year",
+       x = "Year", y = "Share of rows", color = "Flag") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+
+
+df <- tibble(score = subcontracts_expanded$best_local_score_any) %>%
+  filter(is.finite(score))
+
+p_med <- median(df$score, na.rm = TRUE)
+p90   <- quantile(df$score, 0.90, na.rm = TRUE, names = FALSE)
+
+ggplot(df, aes(x = score)) +
+  geom_histogram(
+    aes(y = after_stat(count / sum(count))),
+    binwidth = 0.025, boundary = 0, closed = "left",
+    color = "white"
+  ) +
+  # comment out the next line if you don’t want a tau marker
+  geom_vline(xintercept = tau,  linewidth = 0.9) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Distribution of Best Local Scores",
+    x = "Best local score (0–1)",
+    y = "Share of rows"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+# NAICS6: Top-3 cumulative mass vs. number of observations
+priors6_top3_freq <- priors6$prior %>%
+  group_by(NAICS) %>%
+  summarise(total_n = sum(n), .groups = "drop") %>%
+  inner_join(priors6$summary, by = "NAICS")
+
+ggplot(priors6_top3_freq, aes(x = total_n, y = top3)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(se = FALSE) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "Top-3 Cumulative Probability vs Frequency (NAICS6)",
+    x = "Number of entity–PSC pairs (frequency)",
+    y = "Top-3 cumulative probability"
+  ) +
+  theme_minimal()
+
+ggplot(priors6_top3_freq, aes(x = total_n, y = top3)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_smooth(se = FALSE, color = "red") +
+  scale_x_log10(labels = scales::comma) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "Top-3 Cumulative Probability vs Frequency (NAICS6)",
+    x = "Number of entity–PSC pairs (log scale)",
+    y = "Top-3 cumulative probability"
+  ) +
+  theme_minimal()
+
+
+# NAICS4: Top-3 cumulative mass vs. number of observations
+priors4_top3_freq <- priors4$prior %>%
+  group_by(NAICS) %>%
+  summarise(total_n = sum(n), .groups = "drop") %>%
+  inner_join(priors4$summary, by = "NAICS")
+
+ggplot(priors4_top3_freq, aes(x = total_n, y = top3)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(se = FALSE) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(
+    title = "Top-3 Cumulative Probability vs Frequency (NAICS4)",
+    x = "Number of entity–PSC pairs (frequency)",
+    y = "Top-3 cumulative probability"
+  ) +
+  theme_minimal()
+
+
+# add effective PSC count
+priors6_eff <- priors6$summary %>%
+  mutate(effective_pscs = exp(entropy)) %>%
+  inner_join(
+    priors6$prior %>%
+      group_by(NAICS) %>%
+      summarise(total_n = sum(n), .groups = "drop"),
+    by = "NAICS"
+  )
+
+summary(priors6_eff$effective_pscs)
+
+ggplot(priors6_eff, aes(x = total_n, y = effective_pscs)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_smooth(se = FALSE, color = "red") +
+  scale_x_log10(labels = scales::comma) +
+  labs(
+    title = "Effective Number of PSCs vs Frequency (NAICS6)",
+    x = "Number of entity–PSC pairs (log scale)",
+    y = "Effective number of PSCs"
+  ) +
+  theme_minimal()
+
+# repeat for NAICS4
+priors4_eff <- priors4$summary %>%
+  mutate(effective_pscs = exp(entropy)) %>%
+  inner_join(
+    priors4$prior %>%
+      group_by(NAICS) %>%
+      summarise(total_n = sum(n), .groups = "drop"),
+    by = "NAICS"
+  )
+
+ggplot(priors4_eff, aes(x = total_n, y = effective_pscs)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_smooth(se = FALSE, color = "red") +
+  scale_x_log10(labels = scales::comma) +
+  labs(
+    title = "Effective Number of PSCs vs Frequency (NAICS4)",
+    x = "Number of entity–PSC pairs (log scale)",
+    y = "Effective number of PSCs"
+  ) +
+  theme_minimal()
+
 
 ```
+
+
+```{r }
+
+core2 <- core2 %>%
+  mutate(year = year(FILE_SNAPSHOT_D))
+
+priors6_by_year <- core2 %>%
+  filter(!is.na(NAICS_primary_6), !is.na(PSC_list)) %>%
+  mutate(NAICS6 = NAICS_primary_6) %>%
+  unnest(PSC_list) %>%
+  filter(!is.na(PSC_list)) %>%
+  count(year, NAICS6, PSC_list, name = "n") %>%
+  group_by(year, NAICS6) %>%
+  mutate(prob = n / sum(n)) %>%
+  summarise(
+    entropy = -sum(prob * log(prob)),
+    effective_pscs = exp(-sum(prob * log(prob))),
+    n_psc = n(),
+    total_n = sum(n),
+    .groups = "drop"
+  )
+
+
+priors6_by_year %>%
+  group_by(year) %>%
+  summarise(mean_entropy = mean(entropy, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = year, y = mean_entropy)) +
+  geom_line(color = "steelblue") +
+  labs(
+    title = "Average PSC Entropy Across NAICS6 Over Time",
+    x = "Year",
+    y = "Mean entropy"
+  ) +
+  theme_minimal()
+
+
+ggplot(priors6_by_year, aes(x = factor(year), y = entropy)) +
+  geom_boxplot(outlier.size = 0.5) +
+  labs(
+    title = "Distribution of PSC Entropy by Year (NAICS6)",
+    x = "Year",
+    y = "Entropy"
+  ) +
+  theme_minimal()
+
+
+
+
+```
+
+
+
