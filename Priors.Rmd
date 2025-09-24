@@ -1,0 +1,133 @@
+---
+title: "Priors"
+output: html_document
+date: "2025-09-23"
+---
+
+```{r setup, include=FALSE}
+
+library(arrow)
+library(dplyr)
+library(stringr)
+library(here)
+library(rlang)
+
+src_dir <- here("Data","Prior","RawCSV")
+out_dir <- here("Data","Prior","Priors")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+ds <- open_dataset(src_dir, format = "csv")
+
+naics_col <- "naics_code"
+psc_col   <- "product_or_service_code"
+
+pairs <- ds %>%
+  select(all_of(c(naics_col, psc_col))) %>%
+  rename(naics_raw = !!dplyr::sym(naics_col), psc_raw = !!dplyr::sym(psc_col)) %>%
+  mutate(
+    naics = substr(gsub("[^0-9]", "", arrow::cast(naics_raw, arrow::string())), 1, 6),
+    psc   = toupper(substr(gsub("[^A-Za-z0-9]", "", arrow::cast(psc_raw, arrow::string())), 1, 4))
+  ) %>%
+  select(naics, psc) %>%
+  filter(nchar(naics) == 6, nchar(psc) == 4)
+
+
+prior_naics6_psc <- pairs %>%
+  group_by(naics, psc) %>%
+  summarise(n = dplyr::n(), .groups = "drop_last") %>%
+  mutate(n_naics = sum(n), p = n / n_naics) %>%
+  ungroup() %>%
+  arrange(naics, desc(p))
+
+prior_naics4_psc <- pairs %>%
+  mutate(naics4 = substr(naics, 1, 4)) %>%
+  group_by(naics4, psc) %>%
+  summarise(n = dplyr::n(), .groups = "drop_last") %>%
+  mutate(n_naics = sum(n), p = n / n_naics) %>%
+  ungroup() %>%
+  arrange(naics4, desc(p))
+
+
+priors6_df <- tryCatch(collect(prior_naics6_psc), error = function(e) prior_naics6_psc)
+
+priors6_summary <- priors6_df %>%
+  filter(p > 0) %>%
+  group_by(naics) %>%
+  summarise(
+    entropy = -sum(p * log(p)),
+    effective_pscs = exp(entropy),
+    total_n = sum(n),
+    .groups = "drop"
+  )
+
+print(summary(priors6_summary$effective_pscs))
+
+ggplot(priors6_summary, aes(x = total_n, y = effective_pscs)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(se = FALSE) +
+  scale_x_log10(labels = comma) +
+  labs(
+    title = "Effective Number of PSCs vs Frequency (NAICS6)",
+    x = "Number of NAICS–PSC pairs (log scale)",
+    y = "Effective number of PSCs"
+  ) +
+  theme_minimal()
+
+head(arrange(priors6_summary, desc(effective_pscs)), 25)
+
+
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+write_parquet(collect(prior_naics6_psc), file.path(out_dir, "prior_naics6_psc.parquet"))
+write_parquet(collect(prior_naics4_psc), file.path(out_dir, "prior_naics4_psc.parquet"))
+saveRDS(list(naics6 = collect(prior_naics6_psc), naics4 = collect(prior_naics4_psc)), file.path(out_dir, "priors_naics_psc.rds"))
+
+
+prior6 <- tbl %>%
+  group_by(naics6, psc4) %>%
+  summarise(n = n(), .groups = "drop_last") %>%
+  mutate(n_naics = sum(n)) %>%
+  ungroup() %>%
+  mutate(p = n / n_naics) %>%
+  arrange(naics6, desc(p))
+
+prior4 <- tbl %>%
+  filter(!is.na(naics4), naics4 != "") %>%
+  group_by(naics4, psc4) %>%
+  summarise(n = n(), .groups = "drop_last") %>%
+  mutate(n_naics = sum(n)) %>%
+  ungroup() %>%
+  mutate(p = n / n_naics) %>%
+  arrange(naics4, desc(p))
+
+p6 <- collect(prior6)
+p4 <- collect(prior4)
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+write_parquet(p6, file.path(out_dir, "prior_naics6_psc.parquet"))
+write_parquet(p4, file.path(out_dir, "prior_naics4_psc.parquet"))
+saveRDS(list(naics6 = p6, naics4 = p4), file = file.path(out_dir, "priors_naics_psc.rds"))
+
+
+top3_mass <- priors6_df %>%
+  group_by(naics) %>%
+  slice_max(order_by = p, n = 3, with_ties = FALSE) %>%
+  summarise(cum_top3 = sum(p), .groups = "drop")
+
+ggplot(top3_mass, aes(x = cum_top3)) +
+  geom_histogram(binwidth = 0.05, boundary = 0, closed = "left") +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1)) +
+  labs(
+    title = "Cumulative mass of top 3 PSC probabilities per NAICS6",
+    x = "Sum of top-3 PSC probabilities",
+    y = "Count of NAICS6"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+
+
+

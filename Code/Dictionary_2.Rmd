@@ -56,6 +56,46 @@ Practical knobs: tighten canonicalization via JW\_THRESH in Stage 5. If junk exp
 conflicts_prefer(dplyr::filter)
 
 
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(digest)
+
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(openssl)
+
+canon <- function(x) x |> replace_na("") |> str_squish() |> str_to_lower()
+
+subcontract <- subcontract %>%
+  mutate(
+    name_c = canon(subawardee_name),
+    desc_c = canon(subaward_description),
+    id_comp = if_else(!is.na(recipient_uei) & recipient_uei != "", paste0("uei:", recipient_uei), paste0("name:", name_c)),
+    pair_key = md5(paste0(id_comp, "||", desc_c))
+  )
+
+subcontract %>% count(pair_key) %>% arrange(desc(n)) %>% head()
+
+subcontracts <- subcontract %>%
+  group_by(pair_key) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  select(pair_key, subawardee_name, subaward_description)
+
+stopifnot(nrow(text_seed) == dplyr::n_distinct(text_seed$pair_key))
+
+
+row_key_text_dedupe <- subcontract
+  
+saveRDS(row_key_text_dedupe, here("Data", "dta", "rowkey_text_dedupe.rds"))
+  
+saveRDS(text_seed, here("Data", "dta", "text_seed.rds"))
+
+
+subcontracts <- text_seed
+
 ```
 
 
@@ -1664,161 +1704,6 @@ cat(sprintf("Suggested τ (~5 repl/1k): %.3f\" ))
 
 
 ```{r}
-# ---- Stage 6 Metrics: Visualizations ----
-suppressPackageStartupMessages({
-  library(dplyr)
-  library(tidyr)
-  library(ggplot2)
-  library(scales)
-  library(readr)
-  library(here)
-  library(fs)
-})
-
-visualize_stage6 <- function(
-  proc_dir = here("Data", "processed"),
-  out_dir  = file.path(proc_dir, "figs"),
-  save_png = TRUE, width = 8, height = 5, dpi = 150
-) {
-  cand_path <- file.path(proc_dir, "acr_candidates.rds")
-  stopifnot(file.exists(cand_path))
-  dir_create(out_dir, recurse = TRUE)
-
-  x <- readRDS(cand_path)
-
-  # --- guards: only keep columns that exist
-  need <- c("acr","exp_uc","score_raw","score","prior",
-            "freq","doc_coverage","def_hits","auth_hits","rank")
-  miss <- setdiff(need, names(x))
-  if (length(miss)) message("Note: missing columns -> ", paste(miss, collapse=", "))
-
-  # lightweight cleaning / derived fields
-  x <- x %>%
-    mutate(
-      log_freq      = log1p(freq %||% 0L),
-      def_bucket    = factor(pmin(def_hits %||% 0L, 2), labels = c("0","1","2+")),
-      auth_flag     = (auth_hits %||% 0L) > 0L
-    )
-
-  # 1) Distributions of score/prior
-  p_dist <- x %>%
-    select(score_raw = score_raw, prior = prior, score = score) %>%
-    pivot_longer(everything(), names_to = "metric", values_to = "value") %>%
-    filter(is.finite(value)) %>%
-    ggplot(aes(value, after_stat(density), fill = metric)) +
-    geom_histogram(bins = 50, alpha = 0.65, position = "identity") +
-    facet_wrap(~ metric, ncol = 1, scales = "free_y") +
-    labs(title = "Stage 6: Distributions", x = "Value", y = "Density") +
-    theme_minimal(base_size = 12) + theme(legend.position = "none")
-
-  # 2) Relationship: frequency vs score_raw
-  p_freq <- x %>%
-    filter(is.finite(log_freq), is.finite(score_raw)) %>%
-    ggplot(aes(log_freq, score_raw)) +
-    geom_point(alpha = 0.25, size = 1) +
-    geom_smooth(method = "loess", se = FALSE) +
-    labs(title = "Frequency vs. Raw Score",
-         x = "log1p(freq)", y = "score_raw") +
-    theme_minimal(base_size = 12)
-
-  # 3) Relationship: document coverage vs score_raw
-  p_doc <- x %>%
-    filter(is.finite(doc_coverage), is.finite(score_raw)) %>%
-    ggplot(aes(doc_coverage, score_raw)) +
-    geom_point(alpha = 0.25, size = 1) +
-    geom_smooth(method = "loess", se = FALSE) +
-    labs(title = "Document Coverage vs. Raw Score",
-         x = "Distinct documents (coverage)", y = "score_raw") +
-    theme_minimal(base_size = 12)
-
-  # 4) Definition hits vs score_raw
-  p_def <- x %>%
-    filter(is.finite(score_raw)) %>%
-    ggplot(aes(def_bucket, score_raw, fill = def_bucket)) +
-    geom_violin(trim = TRUE, alpha = 0.6) +
-    geom_boxplot(width = 0.15, outlier.shape = NA) +
-    labs(title = "Definition Hits vs. Raw Score",
-         x = "Definition hits (0/1/2+)", y = "score_raw") +
-    theme_minimal(base_size = 12) + theme(legend.position = "none")
-
-  # 5) Candidate yield per acronym
-  per_acr <- x %>% count(acr, name = "n_cand")
-  p_yield <- per_acr %>%
-    ggplot(aes(n_cand)) +
-    geom_histogram(binwidth = 1, boundary = 0, closed = "left", fill = "grey60") +
-    scale_x_continuous(breaks = pretty_breaks()) +
-    labs(title = "Candidates per Acronym", x = "# candidates per ACR", y = "Count of acronyms") +
-    theme_minimal(base_size = 12)
-
-  # 6) DAU authority share across score deciles
-  p_auth <- x %>%
-    filter(is.finite(score)) %>%
-    mutate(dec = ntile(score, 10)) %>%
-    group_by(dec) %>%
-    summarise(share_auth = mean(auth_flag, na.rm = TRUE), .groups = "drop") %>%
-    ggplot(aes(dec, share_auth)) +
-    geom_col() +
-    scale_y_continuous(labels = percent_format()) +
-    labs(title = "DAU Authority Share by Score Decile",
-         x = "Score decile (within acronym ranking)", y = "Share with DAU hit") +
-    theme_minimal(base_size = 12)
-
-  # 7) Top-vs-runner-up margin (how separable is the best choice?)
-  gaps <- x %>%
-    filter(rank %||% NA_integer_ <= 2L) %>%
-    arrange(acr, rank) %>%
-    group_by(acr) %>%
-    summarise(gap = (score[rank == 1] %||% NA) - (score[rank == 2] %||% NA),
-              .groups = "drop")
-  p_gap <- gaps %>%
-    ggplot(aes(gap)) +
-    geom_histogram(bins = 40, fill = "steelblue") +
-    labs(title = "Top-2 Score Gap per Acronym",
-         x = "score(top1) – score(top2)", y = "Count of acronyms") +
-    theme_minimal(base_size = 12)
-
-  plots <- list(
-    dist = p_dist, freq_vs_score = p_freq, doccov_vs_score = p_doc,
-    defhits_vs_score = p_def, yield_per_acr = p_yield,
-    dau_share_by_decile = p_auth, top2_gap = p_gap
-  )
-
-  if (isTRUE(save_png)) {
-    ggsave(file.path(out_dir, "stage6_dist.png"),            p_dist, width = width, height = height, dpi = dpi)
-    ggsave(file.path(out_dir, "stage6_freq_vs_score.png"),   p_freq, width = width, height = height, dpi = dpi)
-    ggsave(file.path(out_dir, "stage6_doccov_vs_score.png"), p_doc,  width = width, height = height, dpi = dpi)
-    ggsave(file.path(out_dir, "stage6_defhits_vs_score.png"),p_def,  width = width, height = height, dpi = dpi)
-    ggsave(file.path(out_dir, "stage6_yield_per_acr.png"),   p_yield,width = width, height = height, dpi = dpi)
-    ggsave(file.path(out_dir, "stage6_dau_share_decile.png"),p_auth, width = width, height = height, dpi = dpi)
-    ggsave(file.path(out_dir, "stage6_top2_gap.png"),        p_gap,  width = width, height = height, dpi = dpi)
-  }
-
-  # quick textual summary (prints in console)
-  summary_tbl <- tibble::tibble(
-    n_candidates = nrow(x),
-    n_unique_acr = dplyr::n_distinct(x$acr),
-    med_score_raw = median(x$score_raw, na.rm = TRUE),
-    med_prior     = median(x$prior, na.rm = TRUE),
-    med_score     = median(x$score, na.rm = TRUE),
-    auth_share    = mean(x$auth_flag, na.rm = TRUE)
-  )
-  print(summary_tbl)
-
-  invisible(plots)
-}
-
-# Example usage:
-plots <- visualize_stage6()
-# To display in the Rmd, print any plot, e.g.:
-# plots$dist; plots$freq_vs_score; plots$defhits_vs_score
-
-plots$dist
-plots$freq_vs_score
-plots$doccov_vs_score
-plots$defhits_vs_score
-plots$yield_per_acr
-plots$dau_share_by_decile
-plots$top2_gap
 
 
  lubridate::year(lubridate::date(sub_date))) %>% 
@@ -1830,12 +1715,7 @@ plots$top2_gap
   ) %>%  
   ggplot(aes(x = year)) + 
   geom_line(aes( y = mean_junky))
-  
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-library(lubridate)
-library(scales)
+
 
 subcontracts_with_flags %>%
   mutate(year = lubridate::year(lubridate::as_date(sub_date))) %>% 
@@ -1959,76 +1839,6 @@ ggplot(priors6_eff, aes(x = total_n, y = effective_pscs)) +
     y = "Effective number of PSCs"
   ) +
   theme_minimal()
-
-# repeat for NAICS4
-priors4_eff <- priors4$summary %>%
-  mutate(effective_pscs = exp(entropy)) %>%
-  inner_join(
-    priors4$prior %>%
-      group_by(NAICS) %>%
-      summarise(total_n = sum(n), .groups = "drop"),
-    by = "NAICS"
-  )
-
-ggplot(priors4_eff, aes(x = total_n, y = effective_pscs)) +
-  geom_point(alpha = 0.6, color = "steelblue") +
-  geom_smooth(se = FALSE, color = "red") +
-  scale_x_log10(labels = scales::comma) +
-  labs(
-    title = "Effective Number of PSCs vs Frequency (NAICS4)",
-    x = "Number of entity–PSC pairs (log scale)",
-    y = "Effective number of PSCs"
-  ) +
-  theme_minimal()
-
-
-```
-
-
-```{r }
-
-core2 <- core2 %>%
-  mutate(year = year(FILE_SNAPSHOT_D))
-
-priors6_by_year <- core2 %>%
-  filter(!is.na(NAICS_primary_6), !is.na(PSC_list)) %>%
-  mutate(NAICS6 = NAICS_primary_6) %>%
-  unnest(PSC_list) %>%
-  filter(!is.na(PSC_list)) %>%
-  count(year, NAICS6, PSC_list, name = "n") %>%
-  group_by(year, NAICS6) %>%
-  mutate(prob = n / sum(n)) %>%
-  summarise(
-    entropy = -sum(prob * log(prob)),
-    effective_pscs = exp(-sum(prob * log(prob))),
-    n_psc = n(),
-    total_n = sum(n),
-    .groups = "drop"
-  )
-
-
-priors6_by_year %>%
-  group_by(year) %>%
-  summarise(mean_entropy = mean(entropy, na.rm = TRUE), .groups = "drop") %>%
-  ggplot(aes(x = year, y = mean_entropy)) +
-  geom_line(color = "steelblue") +
-  labs(
-    title = "Average PSC Entropy Across NAICS6 Over Time",
-    x = "Year",
-    y = "Mean entropy"
-  ) +
-  theme_minimal()
-
-
-ggplot(priors6_by_year, aes(x = factor(year), y = entropy)) +
-  geom_boxplot(outlier.size = 0.5) +
-  labs(
-    title = "Distribution of PSC Entropy by Year (NAICS6)",
-    x = "Year",
-    y = "Entropy"
-  ) +
-  theme_minimal()
-
 
 
 

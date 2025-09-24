@@ -1,0 +1,188 @@
+---
+title: "Write_Query"
+output: html_document
+date: "2025-09-04"
+---
+
+```{r setup, include=FALSE}
+
+
+library(data.table)
+library(digest)
+library(dplyr)
+library(fs)
+library(here)
+library(httr2)
+library(jsonlite)
+library(purrr)
+library(readr)
+library(quanteda)
+library(readxl)
+library(stringdist)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(tidytext)
+library(spacyr)
+library(stringi)
+library(ggplot2)
+library(scales)
+library(conflicted)
+library(reticulate)
+library(spacyr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(tibble)
+library(httr2)
+library(fs)
+library(arrow)
+
+conflicted::conflicts_prefer(dplyr::lag)
+
+
+options(scipen = 999)
+`%||%` <- function(a,b) if (is.null(a) || (is.atomic(a) && length(a)==1 && is.na(a))) b else a
+options(mc.cores = 7)
+
+
+# Sys.setenv(RETICULATE_PYTHON="~/.virtualenvs/rgee_final/bin/python")
+# use_python("~/.virtualenvs/rgee_final/bin/python", required = TRUE)
+# cfg <- py_config()
+# 
+# system2(cfg$python, c("-m","spacy","download","en_core_web_sm"))
+# 
+# spacy_initialize(python_executable = cfg$python, model = "en_core_web_sm")
+
+
+
+```
+
+
+```{r}
+
+
+collapse_phrase_acronym_echo <- function(x){ x <- gsub("\\b([A-Za-z][A-Za-z\\s]{2,}?)(\\s*\\(([A-Z]{2,6})\\))","\\1",x,perl=TRUE); gsub("\\b([A-Z]{2,6})\\s*\\(\\1\\)","\\1",x,perl=TRUE) }
+strip_admin_tails <- function(x){ x <- gsub("\\b(PERIOD OF PERFORMANCE|PRIME CONTRACT NO\\.|SUBCONTRACT NO\\.|MODIFICATION NO\\.)\\b[^\\.;\\n]*","",x,perl=TRUE); gsub("\\b(FUNDED BY|REQUESTED BY)\\b[^\\.;\\n]*","",x,perl=TRUE) }
+drop_serials_ids_dates <- function(x){ x <- gsub("\\b[A-Z]{2,}\\d[\\w\\-\\.]{4,}\\b","",x,perl=TRUE); x <- gsub("\\b\\d{4}\\b","",x,perl=TRUE); x <- gsub("\\b(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\\s+\\d{1,2},?\\s*\\d{4}\\b","",x,perl=TRUE); gsub("\\bfrom\\s+[^\\s]+\\s+to\\s+[^\\s]+","",x,ignore.case=TRUE,perl=TRUE) }
+dedup_ngrams <- function(x){ w <- unlist(strsplit(x,"\\s+")); if (length(w)<6) return(str_squish(x)); res <- w[1]; for(i in 2:length(w)){ prev5 <- tail(res,5); cand <- w[i]; if (length(prev5) && tail(prev5,1)==cand) next; res <- c(res,cand) }; str_squish(paste(res,collapse=" ")) }
+preclean_text <- function(x){ x %>% collapse_phrase_acronym_echo() %>% strip_admin_tails() %>% drop_serials_ids_dates() %>% dedup_ngrams() %>% str_squish() }
+split_to_units <- function(text){ s <- unlist(stringi::stri_split_boundaries(text,type="sentence"),use.names=FALSE); s <- s[nzchar(s)]; s <- vapply(s, preclean_text, character(1)); unique(s[nzchar(s)]) }
+
+```
+
+
+```{r}
+
+
+
+build_global_idf <- function(text_vec){
+  text_vec <- as.character(text_vec); text_vec[is.na(text_vec)] <- ""
+  text_vec <- vapply(text_vec, preclean_text, character(1))
+  toks <- tokens(text_vec, remove_punct=TRUE, remove_numbers=TRUE)
+  toks <- tokens_tolower(toks)
+  toks <- tokens_remove(toks, stopwords("en"))
+  dfm  <- dfm(toks)
+  N    <- ndoc(dfm); df <- Matrix::colSums(dfm>0)
+  idf  <- log((N+1)/(df+1))
+  structure(as.numeric(idf), names = featnames(dfm))
+}
+idf_path <- here("Data","TF_IDF","idf_vocab.rds")
+if (!fs::file_exists(idf_path)) { idf_vocab <- build_global_idf(subcontracts$expanded_description); fs::dir_create(fs::path_dir(idf_path)); saveRDS(idf_vocab,idf_path) }
+idf_vocab <- readRDS(idf_path)
+
+
+```
+
+
+```{r}
+
+
+admin_penalty_vec <- function(x){
+  nchar_x <- nchar(x)
+  up_ratio <- ifelse(nchar_x>0, vapply(strsplit(x,""), function(cs) sum(cs %in% LETTERS), numeric(1))/nchar_x, 0)
+  dig_sym  <- str_count(x,"[0-9]")+str_count(x,"[-_/\\.]")
+  dates    <- str_count(x,"\\b(19|20)\\d{2}\\b|\\bjan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec\\b")
+  id_like  <- str_count(x,"\\b[A-Z]{2,}\\d[\\w\\-]{3,}\\b")
+  enum_p   <- str_count(x,",")+str_count(x,";")
+  0.6*pmin(up_ratio,1)+0.1*pmin(dig_sym/6,1)+0.1*pmin(dates,3)/3+0.1*pmin(id_like,3)/3+0.1*pmin(enum_p,5)/5
+}
+verbiness_spacy <- function(sents){
+  parsed <- spacy_parse(sents, pos=TRUE, tag=FALSE, entity=FALSE, dependency=FALSE)
+  if (!nrow(parsed)) return(rep(0,length(sents)))
+  agg <- parsed |> group_by(doc_id) |> summarise(n_verbs=sum(pos=="VERB",na.rm=TRUE), n_toks=n(), has_obj=any(lag(pos)=="VERB" & pos=="NOUN",na.rm=TRUE), .groups="drop")
+  score <- (agg$n_verbs/pmax(agg$n_toks,1))+ifelse(agg$has_obj,0.3,0)
+  order_ids <- as.character(seq_along(sents)); idx <- match(order_ids, agg$doc_id)
+  res <- numeric(length(sents)); res[!is.na(idx)] <- score[idx[!is.na(idx)]]; res
+}
+tfidf_sentences <- function(sents, idf_vocab){
+  toks <- tokens(sents, remove_punct=TRUE, remove_numbers=TRUE)
+  toks <- tokens_tolower(toks)
+  toks <- tokens_remove(toks, stopwords("en"))
+  dfm_s <- dfm(toks); feats <- featnames(dfm_s)
+  common <- intersect(feats, names(idf_vocab)); if (!length(common)) return(rep(0,nrow(dfm_s)))
+  dfm_s <- dfm_s[, common, drop=FALSE]; as.numeric(dfm_s %*% idf_vocab[common])
+}
+assemble_ranked <- function(sentences, scores, max_chars=250, max_units=3){
+  if (!length(sentences)) return("")
+  ord <- order(scores, decreasing=TRUE); selected <- character(0); used <- 0L
+  for (i in ord){ cand <- sentences[i]; if (!nzchar(cand)) next; add <- ifelse(length(selected)>0,1L,0L)+nchar(cand); if (used+add>max_chars) next; selected <- c(selected,cand); used <- used+add; if (length(selected)>=max_units || used>=max_chars-1L) break }
+  if (!length(selected)) { longest <- sentences[which.max(nchar(sentences))]; return(str_squish(substr(longest,1L,max_chars))) }
+  str_squish(substr(paste(selected,collapse=" "),1L,max_chars))
+}
+
+
+```
+
+```{r}
+split_sentences_df <- function(text_vec){
+  text_vec <- vapply(text_vec, preclean_text, character(1))
+  ss <- stringi::stri_split_boundaries(text_vec, type="sentence")
+  row_id <- rep(seq_along(ss), lengths(ss))
+  sentences <- unlist(ss, use.names=FALSE)
+  keep <- nzchar(sentences)
+  data.frame(row_id=row_id[keep], sentence=vapply(sentences[keep], preclean_text, character(1)), stringsAsFactors=FALSE)
+}
+make_psc_query_fast <- function(df, subawardee_col="subawardee_name", expanded_col="expanded_description", max_chars=250, idf_vocab=get("idf_vocab", envir=.GlobalEnv, inherits=TRUE)){
+  desc <- tidyr::replace_na(as.character(df[[expanded_col]]), "")
+  suba <- tidyr::replace_na(as.character(df[[subawardee_col]]), "")
+  desc_clean <- vapply(desc, preclean_text, character(1))
+  prefixes <- ifelse(nzchar(suba), paste0(suba, ": "), ""); rooms <- pmax(0L, max_chars - nchar(prefixes))
+  sent_df <- split_sentences_df(desc)
+  if (!nrow(sent_df)) return(mutate(df, psc_query_250=str_squish(substr(paste0(prefixes,desc_clean),1L,max_chars))))
+  vscore <- verbiness_spacy(sent_df$sentence)
+  apen   <- admin_penalty_vec(sent_df$sentence)
+  len    <- nchar(sent_df$sentence); lbon <- scales::rescale(pmax(0, pmin(len,160)-40), to=c(0,0.15))
+  tfidf  <- tfidf_sentences(sent_df$sentence, idf_vocab)
+  sent_df$score <- 0.8*tfidf + 1.0*vscore - 0.7*apen + 0.3*lbon
+  row_splits <- split(seq_len(nrow(sent_df)), sent_df$row_id)
+  assemble_row <- function(j){ ix <- row_splits[[j]]; assembled <- assemble_ranked(sent_df$sentence[ix], sent_df$score[ix], max_chars=rooms[j], max_units=3); if (!nzchar(assembled)) str_squish(substr(desc_clean[j],1L,rooms[j])) else assembled }
+  assembled <- vapply(seq_along(row_splits), assemble_row, character(1))
+  out <- str_squish(substr(paste0(prefixes,assembled),1L,max_chars))
+  mutate(df, psc_query_250=out)
+}
+
+
+```
+
+
+```{r}
+subcontracts_expanded <- make_psc_query_fast(subcontracts_expanded)
+
+test <- make_psc_query(test)
+
+out <- test %>% 
+  select(expanded_description, psc_query_250) %>%  
+  mutate(nch = nchar(psc_query_250)) %>% 
+  filter(nch >=245) %>% 
+  head(50)
+
+write.csv(out, "out.csv")
+
+
+
+```
+
+
+
