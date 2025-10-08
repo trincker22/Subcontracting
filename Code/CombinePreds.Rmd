@@ -1,0 +1,425 @@
+---
+title: "CombinePreds"
+output: html_document
+date: "2025-09-30"
+---
+
+```{r}
+library(tidyverse)
+library(here)
+library(arrow)
+library(fs)
+library(purrr)
+
+
+```
+
+
+```{r}
+
+parquet_dir_preds <- here("runs","psc","outputs","preds_topk_stream_wide_run_pk")
+priors_parquet    <- here("Data","Prior","Priors","prior_naics6_psc.parquet")
+uei_join_parquet  <- here("Data","SAM_ER","Priors","uei_join.parquet")     # your UEI mapping built from SAM ER
+rawcsv_dir        <- here("Data","Prior","RawCSV")                         # big DoD CSVs (to augment UEI->NAICS)
+out_dir           <- here("Data","PSC_Preds")
+dir_create(out_dir, recurse = TRUE)
+
+#load 
+preds_ds <- open_dataset(dir_ls(parquet_dir_preds, glob = "*.parquet"))
+preds <- preds_ds %>%
+  collect() 
+
+priors6 <- read_parquet(priors_parquet) %>%
+  transmute(naics = as.character(naics), psc = as.character(psc), p = as.numeric(p))
+
+rowkey_text_fixed_fixed <- read_rds(here("Data", "Join_Keys", "rowkey_text_fixed_fixed.rds"))
+
+
+# 2 : UEI NAICS Key
+if (!file.exists(here("Data", "PSC_Preds", "uei_naics_final.parquet"))) {
+  uei_join <- read_parquet(uei_join_parquet) %>% mutate(UEI = as.character(UEI))
+
+  pick_first6_from_list <- function(x) {
+    if (length(x) == 0 || all(is.na(x))) return(NA_character_)
+    x6 <- x[nchar(x) == 6]
+    if (length(x6)) x6[[1]] else NA_character_
+  }
+
+  uei_from_sam <- uei_join %>%
+    mutate(
+      NAICS_primary_6_bfill = if_else(
+        is.na(NAICS_primary_6),
+        map_chr(NAICS_list, pick_first6_from_list),
+        NAICS_primary_6
+      )
+    ) %>%
+    transmute(UEI, NAICS_from_SAM = NAICS_primary_6_bfill)
+
+  ds_csv <- open_dataset(rawcsv_dir, format = "csv")
+
+  uei_from_csv <- ds_csv %>%
+    select(recipient_uei, naics_code) %>%
+    mutate(
+      UEI   = cast(recipient_uei, string()),
+      naics = substr(gsub("[^0-9]", "", cast(naics_code, string())), 1, 6)
+    ) %>%
+    filter(nchar(naics) == 6, nchar(UEI) > 0) %>%
+    group_by(UEI, naics) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    collect() %>%
+    group_by(UEI) %>%
+    slice_max(order_by = n, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    transmute(UEI, NAICS_from_CSV = naics)
+
+  uei_naics_final <- full_join(uei_from_sam, uei_from_csv, by = "UEI") %>%
+    mutate(
+      NAICS_final = coalesce(NAICS_from_SAM, NAICS_from_CSV),
+      source = case_when(
+        !is.na(NAICS_from_SAM) &  is.na(NAICS_from_CSV) ~ "SAM",
+        is.na(NAICS_from_SAM)  & !is.na(NAICS_from_CSV) ~ "CSV",
+        !is.na(NAICS_from_SAM) & !is.na(NAICS_from_CSV) ~ "Both",
+        TRUE ~ "Missing"
+      ),
+      mismatch_flag = if_else(
+        !is.na(NAICS_from_SAM) & !is.na(NAICS_from_CSV) & NAICS_from_SAM != NAICS_from_CSV,
+        TRUE, FALSE, missing = FALSE
+      )
+    ) %>%
+    select(UEI, NAICS_final, source, mismatch_flag)
+
+  write_parquet(uei_naics_final, here("Data", "PSC_Preds", "uei_naics_final.parquet"))
+} else {
+  uei_naics_final <- read_parquet(here("Data", "PSC_Preds", "uei_naics_final.parquet"))
+}
+
+
+
+# ---------------------------
+# 3) Attach UEI->NAICS to each prediction row
+# ---------------------------
+
+
+# there are 3 joins here. 1 join NAICS into main df by UEI
+# 2 join predictions into main df, here there are 5 predictions per pair, and 
+# many pairkeys occur mutiple times across observations, so the join will be many to many 
+# but we can still verify for correctness knowing 1. that the number of unique pairkeys in 
+# preds = num unique pairkeys in full df, 2. that the size of the output =s num unique pairkeys*5. 
+# 3. we also do it wide and check that the merge is 1:m. 
+
+# join 1 
+
+rowkey_text_wide <- rowkey_text_fixed_fixed %>%  
+  left_join(preds_wide, join_by("pair_key"))
+
+
+rowkey_text_fixed_fixed <- rowkey_text_fixed_fixed %>%
+  left_join(uei_naics_final %>% select(UEI, NAICS_final), by = c("sub_id" = "UEI")) %>%
+  rename(sub_naics = NAICS_final)
+
+rowkey_text_fixed_fixed %>%  
+  mutate(year = lubridate::year(lubridate::date(sub_date))) %>%
+  group_by(year) %>%  
+  summarise(nas = mean(is.na(sub_naics))) %>% 
+  ggplot(aes(x = year, y = nas)) + 
+    geom_line() + 
+    ylim(c(0,1)) + 
+  theme_minimal() + 
+  ggtitle("Observations missing NAICS codes by year")
+  
+
+rowkey_text_fixed_fixed %>%  
+  group_by(sub_id) %>% 
+  slice_head(n = 1) %>% 
+  ungroup() %>%  
+  mutate(year = lubridate::year(lubridate::date(sub_date))) %>%
+  group_by(year) %>%  
+  summarise(nas = mean(is.na(sub_naics))) %>% 
+  ggplot(aes(x = year, y = nas)) + 
+    geom_line() + 
+    ylim(c(0,1)) + 
+  theme_minimal() + 
+  ggtitle("Unique UEIs missing NAICS codes by year")
+  
+# joins 2&3, long and wide, preds into main df 
+
+rowkey_text_fixed_fixed <- rowkey_text_fixed_fixed %>%
+  mutate(pair_key = as.character(pair_key), sub_id = as.character(sub_id))
+
+preds <- preds %>%
+  mutate(pair_key = as.character(pair_key))
+
+preds_norm <- preds %>%
+  group_by(pair_key, psc_code) %>%
+  slice_max(psc_score, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+preds_ranked <- preds_norm %>%
+  group_by(pair_key) %>%
+  arrange(desc(psc_score), psc_code, .by_group = TRUE) %>%
+  mutate(rank = row_number()) %>%
+  ungroup()
+
+preds_top5 <- preds_ranked %>%
+  filter(rank <= 5L)
+
+preds_wide <- preds_top5 %>%
+  select(pair_key, rank, psc_code, psc_name, psc_score) %>%
+  pivot_wider(
+    id_cols = pair_key,
+    names_from = rank,
+    names_prefix = "rank_",
+    values_from = c(psc_code, psc_name, psc_score)
+  )
+
+rowkey_keys <- rowkey_text_fixed_fixed %>% distinct(pair_key)
+
+k_per_key <- preds_top5 %>% count(pair_key, name = "k")
+
+rowkey_text_long <- rowkey_keys %>%
+  left_join(preds_top5, by = "pair_key") %>%
+  left_join(rowkey_text_fixed_fixed %>% distinct(pair_key, sub_id), by = "pair_key") %>%
+  left_join(uei_naics_final %>% select(UEI, NAICS_final), by = c("sub_id" = "UEI")) %>%
+  rename(naics6 = NAICS_final)
+
+expected_rows <- rowkey_keys %>%
+  left_join(k_per_key, by = "pair_key") %>%
+  mutate(k = replace_na(k, 0L), k_eff = pmax(k, 1L)) %>%
+  summarise(exp_rows = sum(k_eff), .groups = "drop") %>%
+  pull(exp_rows)
+
+actual_rows <- nrow(rowkey_text_long)
+
+checks_long <- tibble(
+  n_left_keys = nrow(rowkey_keys),
+  n_pred_keys = n_distinct(preds_top5$pair_key),
+  n_missing_in_preds = length(setdiff(rowkey_keys$pair_key, preds_top5$pair_key)),
+  n_extra_in_preds = length(setdiff(preds_top5$pair_key, rowkey_keys$pair_key)),
+  expected_rows = expected_rows,
+  actual_rows = actual_rows,
+  rows_ok = actual_rows == expected_rows
+)
+
+left_counts <- rowkey_text_fixed_fixed %>% count(pair_key, name = "n_left")
+
+rowkey_text_wide <- rowkey_text_fixed_fixed %>%
+  left_join(preds_wide, by = "pair_key")
+
+post_counts <- rowkey_text_wide %>% count(pair_key, name = "n_post")
+
+
+checks_wide <- tibble(
+  one_row_per_key_in_wide = nrow(preds_wide) == n_distinct(preds_wide$pair_key),
+  no_duplication_after_join = all(
+    left_join(left_counts, post_counts, by = "pair_key") %>%
+      mutate(ok = n_left == n_post) %>%
+      pull(ok)
+  ),
+  share_left_keys_without_wide_match = mean(is.na(rowkey_text_wide$psc_code_rank_1))
+)
+
+# ---------------------------
+# 4) Blend text score with NAICS->PSC prior.
+# ---------------------------
+# lambda puts 70% weight on text, 30% on prior
+lambda <- 0.30
+
+priors_tbl <- priors6 %>%
+  transmute(
+    naics6   = substr(gsub("[^0-9]", "", as.character(naics)), 1, 6),
+    psc_code = toupper(str_trim(as.character(psc))),
+    p_prior  = as.numeric(p)
+  ) %>%
+  filter(nchar(naics6) == 6, !is.na(psc_code), !is.na(p_prior)) %>%
+  distinct(naics6, psc_code, .keep_all = TRUE)
+
+preds_blend <- rowkey_text_long %>%
+  mutate(
+    naics6   = substr(gsub("[^0-9]", "", as.character(naics6)), 1, 6),
+    psc_code = toupper(str_trim(as.character(psc_code)))
+  ) %>%
+  left_join(priors_tbl, by = c("naics6", "psc_code")) %>%
+  group_by(pair_key) %>%
+  mutate(
+    p_prior_norm = {
+      s <- sum(p_prior, na.rm = TRUE)
+      if (is.finite(s) && s > 0) replace_na(p_prior, 0) / s else 0
+    },
+    blend_raw = psc_score + lambda * p_prior_norm,
+    blend_score = {
+      d <- sum(blend_raw, na.rm = TRUE)
+      if (is.finite(d) && d > 0) blend_raw / d else rep(1 / n(), n())
+    }
+  ) %>%
+  arrange(desc(blend_score), desc(psc_score), psc_code, .by_group = TRUE) %>%
+  mutate(rank_blend = row_number()) %>%
+  ungroup()
+
+preds_blend_top5 <- preds_blend %>%
+  group_by(pair_key) %>%
+  slice_head(n = 5) %>%
+  ungroup()
+
+blend_checks <- {
+  top1_text <- rowkey_text_long %>%
+    group_by(pair_key) %>%
+    slice_max(psc_score, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    transmute(pair_key, top_text = psc_code)
+  top1_blend <- preds_blend %>%
+    group_by(pair_key) %>%
+    slice_max(blend_score, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    transmute(pair_key, top_blend = psc_code)
+  key_prior_cov <- preds_blend %>%
+    group_by(pair_key) %>%
+    summarise(has_prior = any(!is.na(p_prior)), .groups = "drop")
+  summary_tbl <- top1_text %>%
+    inner_join(top1_blend, by = "pair_key") %>%
+    left_join(key_prior_cov, by = "pair_key") %>%
+    mutate(changed = top_text != top_blend)
+  tibble(
+    keys = n_distinct(preds_blend$pair_key),
+    share_rows_with_prior = mean(!is.na(preds_blend$p_prior)),
+    share_keys_with_any_prior = mean(key_prior_cov$has_prior),
+    top1_changed_overall = mean(summary_tbl$changed),
+    top1_changed_when_prior = mean(summary_tbl$changed[summary_tbl$has_prior]),
+    top1_changed_when_no_prior = mean(summary_tbl$changed[!summary_tbl$has_prior])
+  )
+}
+
+# ---------------------------
+# 5) Re-rank within pair_key by blend_score, plot score distributions 
+# ---------------------------
+preds_blend <- preds_blend %>%
+  group_by(pair_key) %>%
+  arrange(desc(blend_score), .by_group = TRUE) %>%
+  mutate(rank_blend = row_number()) %>%
+  ungroup() %>%
+  filter(rank_blend <= 5)
+
+
+preds_blend <- preds_blend %>% 
+  mutate(no_prior = is.na(naics6)) 
+
+
+# Histogram of top-ranked scores by prior status
+preds_blend %>%  
+  filter(rank == 1) %>%  
+  ggplot(aes(x = blend_score, fill = no_prior)) + 
+  geom_histogram(bins = 30, alpha = 0.7, color = "white") +
+  facet_wrap(~no_prior, labeller = as_labeller(c(`TRUE` = "No Prior", `FALSE` = "With Prior"))) +
+  scale_fill_manual(values = c("steelblue", "coral")) +
+  theme(legend.position = "none") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Distribution of Blend Scores",
+    subtitle = "Top-ranked predictions split by Prior Availability",
+    x = "Blend Score",
+    y = "Count",
+    fill = "Prior"
+  )
+
+# Violin plot of scores by rank
+preds_blend %>% 
+  filter(!is.na(rank)) %>% 
+  ggplot(aes(x = as.factor(rank), y = blend_score, fill = as.factor(rank))) + 
+  geom_violin(scale = "width", alpha = 0.8, color = "white") + 
+  geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.5) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal(base_size = 14) + 
+  theme(legend.position = "none") +
+  labs(
+    title = "Prediction Scores by Rank",
+    subtitle = "Text-Based Prediction Weighted with NAICS-PSC Prior",
+    x = "Rank",
+    y = "Blend Score",
+    fill = "Rank"
+  )
+
+################
+
+# make wide df again, join preds_blend into rowkey_text by pair_key, join new rowkey_text into prime_sub by row_id. 
+
+preds_blend_topK <- preds_blend %>%
+  group_by(pair_key) %>%
+  arrange(desc(blend_score), desc(psc_score), psc_code, .by_group = TRUE) %>%
+  slice_head(n = 5L) %>%
+  ungroup()
+
+preds_blend_wide <- preds_blend_topK %>%
+  mutate(rank_blend = as.integer(rank_blend)) %>%
+  select(pair_key, rank_blend, psc_code, psc_name, blend_score) %>%
+  pivot_wider(
+    id_cols = pair_key,
+    names_from = rank_blend,
+    values_from = c(psc_code, psc_name, blend_score),
+    names_glue = "{.value}_rank_{rank_blend}"
+  )
+
+stopifnot(nrow(preds_blend_wide) == preds_blend_wide %>% distinct(pair_key) %>% nrow())
+
+rowkey_with_blend_wide <- rowkey_text_fixed_fixed %>%
+  mutate(pair_key = as.character(pair_key)) %>%
+  left_join(preds_blend_wide, by = "pair_key") %>%  
+  select(-c(subawardee_name_c, subaward_description_c, name_c, desc_c))
+
+prime_sub <- read_rds(here("Data", "dta", "prime_sub.rds"))
+
+
+blend_cols <- names(rowkey_with_blend_wide) %>%
+  keep(~ str_detect(.x, "rank"))
+
+final_wide <- prime_sub %>%
+  left_join(
+    rowkey_with_blend_wide %>%
+      select(row_id, all_of(blend_cols)),
+    by = "row_id"
+  ) 
+
+final_wide %>%  
+  mutate(nas = is.na(psc_code_rank_1)) %>%  
+  summarise(nas_mean = mean(nas))
+
+
+
+checks_final <- tibble(
+  n_prime_sub = nrow(prime_sub),
+  n_final_wide = nrow(final_wide),
+  same_rows = nrow(prime_sub) == nrow(final_wide),
+  share_missing_blend_rank1 = mean(is.na(final_wide$psc_code_rank_1)),
+  n_dup_row_id_in_rowkey = rowkey_with_blend_wide %>% count(row_id) %>% filter(n > 1) %>% nrow()
+)
+
+write_rds(rowkey_with_blend_wide, here("Data", "PSC_Preds", "rowkey_with_blend_wide.rds"))
+write_rds(final_wide, here("Data", "PSC_Preds", "final_wide_with_blend_preds.rds"))
+write_rds(checks_final, here("Data", "PSC_Preds", "final_join_checks.rds"))
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+

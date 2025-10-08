@@ -56,46 +56,6 @@ Practical knobs: tighten canonicalization via JW\_THRESH in Stage 5. If junk exp
 conflicts_prefer(dplyr::filter)
 
 
-library(dplyr)
-library(stringr)
-library(tidyr)
-library(digest)
-
-library(dplyr)
-library(stringr)
-library(tidyr)
-library(openssl)
-
-canon <- function(x) x |> replace_na("") |> str_squish() |> str_to_lower()
-
-subcontract <- subcontract %>%
-  mutate(
-    name_c = canon(subawardee_name),
-    desc_c = canon(subaward_description),
-    id_comp = if_else(!is.na(recipient_uei) & recipient_uei != "", paste0("uei:", recipient_uei), paste0("name:", name_c)),
-    pair_key = md5(paste0(id_comp, "||", desc_c))
-  )
-
-subcontract %>% count(pair_key) %>% arrange(desc(n)) %>% head()
-
-subcontracts <- subcontract %>%
-  group_by(pair_key) %>%
-  slice_head(n = 1) %>%
-  ungroup() %>%
-  select(pair_key, subawardee_name, subaward_description)
-
-stopifnot(nrow(text_seed) == dplyr::n_distinct(text_seed$pair_key))
-
-
-row_key_text_dedupe <- subcontract
-  
-saveRDS(row_key_text_dedupe, here("Data", "dta", "rowkey_text_dedupe.rds"))
-  
-saveRDS(text_seed, here("Data", "dta", "text_seed.rds"))
-
-
-subcontracts <- text_seed
-
 ```
 
 
@@ -1389,23 +1349,27 @@ stage8_expand <- function(
                         params=list(alpha=alpha, tau=tau, k_window=k_window, topK=topK),
                         sample_n = length(keep)))
   }
+  
+txtdf <- txtdf %>% dplyr::ungroup()
+stopifnot(nrow(txtdf) == length(expanded_description))
 
-  out <- txtdf %>%
-    dplyr::mutate(
-      expanded_description = expanded_description,
-      acronyms_found       = acronyms_found,
-      num_expanded_tokens  = num_expanded_tokens,
-      mean_local_score     = mean_local_score,      # > tau only
-      best_local_score_any = best_local_score_any,  # observed, incl. < tau
-      ambiguity_flag       = ambiguity_flag
-    ) %>%
-    dplyr::select(-.row_id, -raw_text)
+out <- txtdf %>%
+  dplyr::mutate(
+    expanded_description = .env$expanded_description,
+    acronyms_found       = .env$acronyms_found,
+    num_expanded_tokens  = .env$num_expanded_tokens,
+    mean_local_score     = .env$mean_local_score,
+    best_local_score_any = .env$best_local_score_any,
+    ambiguity_flag       = .env$ambiguity_flag
+  ) %>%
+  dplyr::select(-.row_id, -raw_text)
 
-  .save_rds_meta(out, out_full,
-                 list(stage="stage8_expand_full", created_at=Sys.time(),
-                      params=list(alpha=alpha, tau=tau, k_window=k_window, topK=topK),
-                      workers_used = workers))
-  invisible(out)
+.save_rds_meta(out, out_full,
+               list(stage="stage8_expand_full", created_at=Sys.time(),
+                    params=list(alpha=alpha, tau=tau, k_window=k_window, topK=topK),
+                    workers_used = workers))
+invisible(out)
+
 }
 
 ```
@@ -1629,6 +1593,8 @@ run_from("stage5", thru = "stage7")
 run_expand_tune()
 run_build_once()
 run_expand_full(alpha = 0.8, tau = 0.53, k_window = 12, topK = 2L, workers = 6)
+
+
 
 ```
 

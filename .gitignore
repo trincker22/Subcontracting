@@ -22,5 +22,8 @@ data/processed
 SAM_ER/
 dta/
 Data/Prior/
-Data/TF-IDF/idf_vocab.rds
+Data/TF_IDF/
+Data/Join_Keys/
+Data/
+
 

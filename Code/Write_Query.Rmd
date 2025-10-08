@@ -52,8 +52,8 @@ options(mc.cores = 7)
 # cfg <- py_config()
 # 
 # system2(cfg$python, c("-m","spacy","download","en_core_web_sm"))
-# 
-# spacy_initialize(python_executable = cfg$python, model = "en_core_web_sm")
+ 
+spacy_initialize(python_executable = cfg$python, model = "en_core_web_sm")
 
 
 
@@ -181,8 +181,187 @@ out <- test %>%
 write.csv(out, "out.csv")
 
 
+```
+
+```{r}
+
+rowkey_text_dedupe    <- rowkey_text_dedupe    %>% mutate(pair_key = as.character(pair_key))
+subcontracts_250query <- subcontracts_250query %>% mutate(pair_key = as.character(pair_key))
+
+
+dup_keys <- rowkey_text_dedupe %>%
+  distinct(pair_key, subawardee_name, subaward_description) %>%
+  add_count(pair_key, name = "n_pairs_for_key") %>%
+  filter(n_pairs_for_key > 1) %>%
+  transmute(pair_key_chr = pair_key)
+
+dup_rows_ranked <- rowkey_text_dedupe %>%
+  mutate(pair_key_chr = pair_key) %>%                                     # already character
+  semi_join(dup_keys, by = "pair_key_chr") %>%
+  arrange(pair_key_chr, subawardee_name, subaward_description, row_id) %>%
+  group_by(pair_key_chr, subawardee_name, subaward_description) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  group_by(pair_key_chr) %>%
+  mutate(suffix_idx = dplyr::row_number()) %>%
+  ungroup() %>%
+  mutate(
+    new_pair_key = if_else(
+      suffix_idx == 1L,                 # first keeps original (unsuffixed)
+      pair_key_chr,
+      paste0(pair_key_chr, "~", stringr::str_pad(suffix_idx, 2, pad = "0"))
+    )
+  )
+
+
+pairkey_alias <- dup_rows_ranked %>%
+  filter(new_pair_key != pair_key_chr) %>%
+  transmute(
+    original_pair_key   = pair_key_chr,
+    new_pair_key,
+    subawardee_name,
+    subaward_description
+  )
+
+rows_to_update_verbose <- rowkey_text_dedupe %>%
+  inner_join(
+    dup_rows_ranked %>%
+      select(pair_key_chr, subawardee_name, subaward_description, suffix_idx, new_pair_key),
+    by = c("pair_key" = "pair_key_chr", "subawardee_name", "subaward_description")
+  ) %>%
+  mutate(will_change = new_pair_key != pair_key)
+
+rows_to_update <- rows_to_update_verbose %>%
+  filter(will_change) %>%
+  distinct(row_id, new_pair_key)
+
+
+rowkey_text_fixed <- rowkey_text_dedupe %>%
+  left_join(rows_to_update, by = "row_id") %>%
+  mutate(pair_key = coalesce(new_pair_key, pair_key)) %>%
+  select(-new_pair_key)
+
+
+new_key_inputs <- dup_rows_ranked %>%
+  filter(new_pair_key != pair_key_chr) %>%
+  select(pair_key = new_pair_key, subawardee_name, subaward_description)
+
+# If your writer wants 'expanded_description', map the column name:
+new_key_min_df <- new_key_inputs %>%
+  rename(expanded_description = subaward_description)
+
+# run the dictionary expansion 
+# run the psc query builder
+
+new_key_queries <- make_psc_query_fast(
+  new_key_min_df,
+  subawardee_col = "subawardee_name",
+  expanded_col   = "expanded_description",
+  max_chars      = 250
+) %>%
+  select(pair_key, psc_query_250)
+
+
+# bind into the query df 
+
+subcontracts_250query_fixed <- bind_rows(
+  subcontracts_250query,
+  new_key_queries %>% anti_join(subcontracts_250query, by = "pair_key")
+) %>%
+  distinct(pair_key, .keep_all = TRUE)
+
+# check 
+
+qa <- list(
+  num_dup_keys_detected = n_distinct(dup_rows_ranked$pair_key_chr),
+  num_new_keys_created  = nrow(new_key_queries),
+  row_updates           = nrow(rows_to_update),
+  total_pairs_before    = n_distinct(rowkey_text_dedupe$subawardee_name, rowkey_text_dedupe$subawardee_description),
+  total_pairs_after     = n_distinct(rowkey_text_fixed$subawardee_name, rowkey_text_fixed$subawardee_description),
+  keys_unique_in_psc_tbl= nrow(subcontracts_250query_fixed) == n_distinct(subcontracts_250query_fixed$pair_key)
+)
+print(qa)
+
+dup_rows_ranked %>%
+  count(pair_key_chr, subawardee_name, subawardee_description) %>%
+  filter(n > 1)
+# Expect 0
+dup_rows_ranked %>%
+  count(new_pair_key) %>%
+  filter(n > 1)
+# Expect 0
+before_pairs <- n_distinct(rowkey_text_dedupe$subawardee_name, rowkey_text_dedupe$subawardee_description)
+after_pairs  <- rowkey_text_fixed %>% n_distinct(subawardee_name, subawardee_description)
+stopifnot(before_pairs == after_pairs)
+
+
+dup_rows_ranked %>%
+  filter(new_pair_key != pair_key_chr) %>%
+  distinct(new_pair_key) %>%
+  inner_join(subcontracts_250query %>% distinct(pair_key), by = c("new_pair_key" = "pair_key")) %>%
+  nrow() == 0
+# Expect TRUE
+
+
+try %>%  
+  distinct(subawardee_name, subaward_description) %>%  
+  summarise(ndist = n())
+
+try %>%  
+  distinct(pair_key) %>%  
+  summarise(ndist = n())
+
+rowkey_text_dedupe %>%  
+  distinct(subawardee_name, subaward_description) %>%  
+  summarise(ndist = n())
+
+
+
+# 1) How many keys vs how many pairs in the FIXED table?
+n_keys_fixed  <- dplyr::n_distinct(rowkey_text_fixed$pair_key)
+n_pairs_fixed <- dplyr::n_distinct(rowkey_text_fixed$subawardee_name,
+                                   rowkey_text_fixed$subaward_description)
+n_keys_fixed; n_pairs_fixed  # these should be equal
+
+# 2) Any key still has multiple distinct (name, desc)?
+rowkey_text_fixed %>%
+  dplyr::group_by(pair_key) %>%
+  dplyr::summarise(n_pairs = dplyr::n_distinct(subawardee_name, subaward_description), .groups="drop") %>%
+  dplyr::filter(n_pairs != 1)  # expect 0 rows
+
+# 3) Any (name, desc) still maps to multiple keys?
+rowkey_text_fixed %>%
+  dplyr::group_by(subawardee_name, subaward_description) %>%
+  dplyr::summarise(n_keys = dplyr::n_distinct(pair_key), .groups="drop") %>%
+  dplyr::filter(n_keys != 1)  # expect 0 rows
+
+
+
+outdir <- here::here("Data","Join_Keys")
+dir_create(outdir, recurse = TRUE)
+
+# list of objects to save with "_fixed" suffix
+objs_to_save <- list(
+  dup_keys                   = dup_keys,
+  dup_rows_ranked            = dup_rows_ranked,
+  pairkey_alias              = pairkey_alias,
+  rows_to_update_verbose     = rows_to_update_verbose,
+  rows_to_update             = rows_to_update,
+  rowkey_text_fixed          = rowkey_text_fixed,
+  new_key_inputs             = new_key_inputs
+)
+
+# save each one as RDS with "_fixed" in the filename
+for (nm in names(objs_to_save)) {
+  obj <- objs_to_save[[nm]]
+  saveRDS(obj, file = file.path(outdir, paste0(nm, "_fixed.rds")))
+}
+
+
+
 
 ```
+
 
 
 

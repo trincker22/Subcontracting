@@ -43,72 +43,11 @@ library(scales)
 options(scipen = 999)
 
 
-df <- df %>%
-  dplyr::mutate(row_id = dplyr::row_number())
-
-saveRDS(df, here("Data", "dta", "prime_sub.rds"))
-
-subcontract <- df %>%  
-  select(prime_id, row_id, recipient_uei, psc_code, prime_date, sub_date, 
-         sub_id, subawardee_name, subaward_description, naics6) %>% 
-     rename( 
-     product_or_service_code_descript = psc_code, 
-     naics_code = naics6
-     )
-
- 
-try <-  subcontract %>%  
-   group_by(subawardee_name, subaward_description) %>%  
-   slice_head(n = 1)
-
-
-
-library(dplyr)
-library(digest)
-
-subcontract <- subcontract %>%
-  mutate(pair_key = digest(paste0(subawardee_name, "||", subaward_description), algo = "xxhash64"))
-
-
-
-library(dplyr)
-library(stringr)
-library(tidyr)
-library(digest)
-
-canon <- function(x) { x |> replace_na("") |> str_squish() |> str_to_lower() }
-
-subcontract <- subcontract %>%
-  mutate(
-    subawardee_name_c = canon(subawardee_name),
-    subaward_description_c = canon(subaward_description)
-  )
-
-keys_vec <- paste0(subcontract$subawardee_name_c, "||", subcontract$subaward_description_c)
-
-subcontract$pair_key <- vapply(keys_vec, digest, character(1), algo = "xxhash64", serialize = FALSE)
-
-subcontract %>% count(pair_key) %>% arrange(desc(n)) %>% head()
-
-
-seed <- subcontract %>%
-  distinct(pair_key, subawardee_name, subaward_description)
-
-proc <- seed %>%
-  mutate()  # your text processing here
-
-out <- subcontract %>%
-  left_join(proc, by = "pair_key")
-
-stopifnot(nrow(out) == nrow(subcontract))
-
-
-
-
 ```
 
 
 # Preprocessing Chunk: Add NAICS and PSC Vars, Compute Priors. 
+
 
 
 ```{r}

@@ -50,7 +50,7 @@ prior_naics4_psc <- pairs %>%
 
 priors6_df <- tryCatch(collect(prior_naics6_psc), error = function(e) prior_naics6_psc)
 
-priors6_summary <- priors6_df %>%
+priors6_summary <- prior6 %>%
   filter(p > 0) %>%
   group_by(naics) %>%
   summarise(
@@ -82,9 +82,11 @@ write_parquet(collect(prior_naics6_psc), file.path(out_dir, "prior_naics6_psc.pa
 write_parquet(collect(prior_naics4_psc), file.path(out_dir, "prior_naics4_psc.parquet"))
 saveRDS(list(naics6 = collect(prior_naics6_psc), naics4 = collect(prior_naics4_psc)), file.path(out_dir, "priors_naics_psc.rds"))
 
+prior6 <- read_parquet(here("Data", "Prior", "Priors", "prior_naics6_psc.parquet"))
+
 
 prior6 <- tbl %>%
-  group_by(naics6, psc4) %>%
+  group_by(naics, psc) %>%
   summarise(n = n(), .groups = "drop_last") %>%
   mutate(n_naics = sum(n)) %>%
   ungroup() %>%
@@ -109,10 +111,12 @@ write_parquet(p4, file.path(out_dir, "prior_naics4_psc.parquet"))
 saveRDS(list(naics6 = p6, naics4 = p4), file = file.path(out_dir, "priors_naics_psc.rds"))
 
 
-top3_mass <- priors6_df %>%
+top3_mass <- prior6 %>%
   group_by(naics) %>%
   slice_max(order_by = p, n = 3, with_ties = FALSE) %>%
   summarise(cum_top3 = sum(p), .groups = "drop")
+
+summary(top3_mass$cum_top3)
 
 ggplot(top3_mass, aes(x = cum_top3)) +
   geom_histogram(binwidth = 0.05, boundary = 0, closed = "left") +
@@ -127,7 +131,5 @@ ggplot(top3_mass, aes(x = cum_top3)) +
 
 
 ```
-
-
 
 
