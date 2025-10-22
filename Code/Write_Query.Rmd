@@ -168,7 +168,7 @@ make_psc_query_fast <- function(df, subawardee_col="subawardee_name", expanded_c
 
 
 ```{r}
-subcontracts_expanded <- make_psc_query_fast(subcontracts_expanded)
+subcontracts_expanded1 <- make_psc_query_fast(subcontracts_expanded1)
 
 test <- make_psc_query(test)
 

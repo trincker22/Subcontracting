@@ -1,6 +1,6 @@
 
 .Rhistory
-.RData
+*.RData
 .Ruserdata
 
 .Rproj.user/
@@ -14,6 +14,7 @@ Thumbs.db
 *.html
 *_cache/
 *_files/
+handcode.csv
 
 .Renviron
 subcontracts.RDS

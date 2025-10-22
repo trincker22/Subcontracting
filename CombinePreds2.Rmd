@@ -1,0 +1,459 @@
+---
+title: "CombinePreds2"
+output: html_document
+date: "2025-10-14"
+---
+
+```{r}
+library(data.table)
+library(arrow)
+library(here)
+library(quanteda)
+library(Matrix)
+library(future)
+library(future.apply)
+library(progressr)
+library(stringr)
+library(readxl)
+library(janitor)
+
+setDTthreads(percent = 100)
+Sys.setenv(MKL_NUM_THREADS = "1", OMP_NUM_THREADS = "1")
+plan(multisession, workers = max(2L, parallel::detectCores() - 1L))
+handlers("txtprogressbar")
+
+K_text <- 5L
+chunk_rows <- 25000L
+half_life_days <- 730
+alpha0 <- 10
+w2v_dim <- 200L
+w2v_window <- 5L
+w2v_min_count <- 20L
+w2v_neg <- 10L
+w2v_subsample <- 1e-5
+w2v_epochs <- 10L
+
+desc_tbl <- readRDS(here("Data","Join_Keys","desc_tbl.rds"))
+setDT(desc_tbl)
+desc_tbl[, q := as.character(q)]
+desc_tbl[, pair_key := as.character(pair_key)]
+desc_tbl[, sub_id := as.character(sub_id)]
+desc_tbl[, sub_naics := as.character(sub_naics)]
+
+# 
+# files <- open_dataset(here("runs", "psc", "outputs", "preds_topk_stream_wide_run_pk")) %>%  
+#   collect()
+# library(data.table)
+# ds1 <- ds %>%  
+#   mutate(pair_key = as.character(pair_key))
+# 
+# objs <- mget(c("ds1","files"), ifnotfound = list(NULL, NULL))
+# pred_all <- rbindlist(Filter(Negate(is.null), objs), use.names = TRUE, fill = TRUE)
+# setDT(pred_all)
+# 
+# pred_all[, pair_key := as.character(pair_key)]
+# pred_all[, psc_code := toupper(trimws(as.character(psc_code)))]
+# pred_all <- pred_all[nchar(psc_code) >= 2]
+# pred_all[, psc4 := ifelse(nchar(psc_code) == 4, psc_code, NA_character_)]
+# pred_all[, psc2 := substr(psc_code, 1, 2)]
+# pred_all[, psc_score := as.numeric(psc_score)]
+# pred_all <- pred_all[is.finite(psc_score)]
+# 
+# pred_code <- pred_all[, .(score_code = sum(psc_score, na.rm = TRUE)), by = .(pair_key, psc_code)]
+# pred_code[, psc2 := substr(psc_code, 1, 2)]
+# 
+# api_family_new <- pred_code[, .(score = sum(score_code, na.rm = TRUE)), by = .(pair_key, psc2)]
+# setkey(api_family_new, pair_key, psc2)
+# api_family_new[, score := score / (sum(score) + 1e-9), by = pair_key]
+# 
+# setorder(api_family_new, pair_key, -score)
+# api_family_new[, rank := seq_len(.N), by = pair_key]
+# api_family_new[, margin := score[1L] - score[pmin(2L, .N)], by = pair_key]
+# 
+# top5_new <- api_family_new[rank <= 5L, .(pair_key, psc2, score, rank, margin)]
+# 
+# setDT(desc_tbl)
+# desc_tbl[, pair_key := as.character(pair_key)]
+# 
+# pairs_in_desc   <- unique(desc_tbl$pair_key)
+# pairs_with_pred <- unique(api_family_new$pair_key)
+# 
+# N_total   <- length(pairs_in_desc)
+# N_covered <- length(intersect(pairs_in_desc, pairs_with_pred))
+# N_extra   <- length(setdiff(pairs_with_pred, pairs_in_desc))
+# N_missing <- length(setdiff(pairs_in_desc, pairs_with_pred))
+# 
+# cand_counts <- api_family_new[, .N, by = pair_key]
+# 
+# coverage_stats <- data.table(
+#   total_pair_keys          = N_total,
+#   with_predictions         = N_covered,
+#   coverage_rate            = if (N_total > 0) N_covered / N_total else NA_real_,
+#   missing_predictions      = N_missing,
+#   preds_not_in_desc        = N_extra,
+#   mean_candidates_per_key  = if (nrow(cand_counts)) mean(cand_counts$N) else NA_real_,
+#   median_candidates_per_key= if (nrow(cand_counts)) median(cand_counts$N) else NA_real_,
+#   p25_candidates_per_key   = if (nrow(cand_counts)) as.numeric(quantile(cand_counts$N, 0.25, names = FALSE)) else NA_real_,
+#   p75_candidates_per_key   = if (nrow(cand_counts)) as.numeric(quantile(cand_counts$N, 0.75, names = FALSE)) else NA_real_,
+#   max_candidates_per_key   = if (nrow(cand_counts)) max(cand_counts$N) else NA_real_
+# )
+# 
+# saveRDS(top5_new, here("runs","psc","outputs","ds_final.rds"))
+
+preds <- readRDS(here("runs","psc","outputs","ds_final.rds"))
+setnames(preds, old = c("score"), new = c("psc_score"), skip_absent = TRUE)
+preds[, api_p := psc_score / (sum(psc_score) + 1e-9), by = pair_key]
+api_family <- preds[, .(pair_key, psc2, api_p)]
+
+priors6 <- read_parquet(here("Data","Prior","Priors","prior_naics6_psc.parquet"))
+setDT(priors6)
+priors6[, naics6 := substr(gsub("[^0-9]", "", as.character(naics)), 1, 6)]
+priors6[, psc4   := toupper(str_trim(as.character(psc)))]
+priors6[, p      := as.numeric(p)]
+priors6 <- priors6[nchar(naics6) == 6 & nchar(psc4) == 4 & is.finite(p) & p > 0]
+priors6[, psc2   := substr(psc4, 1, 2)]
+naics_psc2_prior <- priors6[, .(p = sum(p, na.rm = TRUE)), by = .(naics6, psc2)]
+naics_psc2_prior[, p := p / (sum(p) + 1e-9), by = naics6]
+naics_map <- unique(as.data.table(desc_tbl)[, .(pair_key, naics6 = substr(gsub("[^0-9]","", sub_naics), 1, 6))])
+setkey(naics_psc2_prior, naics6)
+setkey(naics_map,         naics6)
+naics_map <- unique(naics_map[!is.na(naics6) & nchar(naics6) == 6])
+naics_map <- naics_map[naics6 %chin% naics_psc2_prior$naics6]
+pk <- unique(naics_map$pair_key)
+batch_size <- 200000L
+batches <- split(pk, ceiling(seq_along(pk) / batch_size))
+p_naics <- rbindlist(lapply(batches, function(bk) {
+  nm <- naics_map[pair_key %in% bk]
+  naics_psc2_prior[
+    nm,
+    on = "naics6",
+    allow.cartesian = TRUE,
+    nomatch = 0L,
+    .(pair_key = i.pair_key, psc2, p_naics = x.p)
+  ][, p_naics := p_naics / (sum(p_naics) + 1e-9), by = pair_key]
+}), use.names = TRUE)
+setDT(p_naics)
+setkey(p_naics, pair_key, psc2)
+p_naics[is.na(p_naics), p_naics := 0]
+
+dod_ds <- open_dataset(here("Data","Prior","RawCSV"), format = "csv")
+uei_cols <- dod_ds |>
+  select(recipient_uei, product_or_service_code, action_date) |>
+  filter(!is_null(recipient_uei), !is_null(product_or_service_code), !is_null(action_date)) |>
+  collect()
+setDT(uei_cols)
+uei_cols[, UEI  := as.character(recipient_uei)]
+uei_cols[, psc4 := toupper(substr(gsub("[^A-Za-z0-9]", "", as.character(product_or_service_code)), 1, 4))]
+uei_cols[, date := as.IDate(as.character(action_date))]
+uei_cols <- uei_cols[nchar(UEI) > 0 & nchar(psc4) == 4 & !is.na(date)]
+uei_cols[, psc2 := substr(psc4, 1, 2)]
+today_ <- Sys.Date()
+decay_lambda <- log(2) / half_life_days
+uei_cols[, w := exp(-decay_lambda * as.numeric(as.IDate(today_) - date))]
+uei_psc_counts <- uei_cols[, .(w_n = sum(w)), by = .(UEI, psc2)]
+global_psc2 <- uei_psc_counts[, .(g_n = sum(w_n)), by = psc2][, g_p := g_n / sum(g_n)]
+setkey(global_psc2, psc2)
+setkey(uei_psc_counts, psc2)
+uei_psc_counts <- global_psc2[uei_psc_counts]
+uei_psc_counts[is.na(g_p), g_p := 1 / uniqueN(psc2)]
+uei_psc_counts[, uei_tot := sum(w_n), by = UEI]
+uei_psc_counts[, den := uei_tot + alpha0]
+uei_psc_counts[, p_shrunk := (w_n + alpha0 * g_p) / den]
+uei_psc2_map <- uei_psc_counts[, .(p_uei = sum(p_shrunk)), by = .(UEI, psc2)]
+uei_psc2_map[, p_uei := p_uei / (sum(p_uei) + 1e-9), by = UEI]
+setkey(uei_psc2_map, UEI, psc2)
+uei_link <- unique(as.data.table(desc_tbl)[, .(pair_key = as.character(pair_key), UEI = as.character(sub_id))])
+uei_link <- uei_link[!is.na(UEI) & nzchar(UEI)]
+setkey(uei_link, UEI)
+uei_link <- uei_link[UEI %chin% uei_psc2_map$UEI]
+u <- unique(uei_link$UEI)
+batches <- split(u, ceiling(seq_along(u) / batch_size))
+p_uei <- rbindlist(lapply(batches, function(bu){
+  lk <- uei_link[.(bu), nomatch = 0L]
+  uei_psc2_map[
+    lk,
+    on = "UEI",
+    allow.cartesian = TRUE,
+    nomatch = 0L,
+    .(pair_key = i.pair_key, psc2, p_uei = x.p_uei)
+  ][, p_uei := p_uei / (sum(p_uei) + 1e-9), by = pair_key]
+}), use.names = TRUE)
+setkey(p_uei, pair_key, psc2)
+p_uei[is.na(p_uei), p_uei := 0]
+
+read_psc_2025 <- function(path, sheet = 1) {
+  hdr <- read_xlsx(path, sheet = sheet, n_max = 0)
+  ct <- rep("guess", length(hdr)); ct[1] <- "text"
+  read_xlsx(path, sheet = sheet, col_types = ct, .name_repair = "minimal") |>
+    clean_names() |>
+    transform(psc_code = {x <- as.character(psc_code); x <- str_squish(x); sub("^(\\d+)\\.0+$", "\\1", x)})
+}
+psc_raw <- read_psc_2025(here("Data","PSC0425.xlsx"))
+setDT(psc_raw)
+psc_raw[, psc_code := toupper(trimws(psc_code))]
+psc_raw[, psc_2 := substr(psc_code, 1, 2)]
+psc_raw[, psc_4 := ifelse(nchar(psc_code) == 4, psc_code, NA_character_)]
+mode_title <- function(x) {
+  x <- str_squish(str_to_sentence(as.character(x)))
+  x <- x[!is.na(x) & nzchar(x)]
+  if (!length(x)) return(NA_character_)
+  tt <- sort(table(x), decreasing = TRUE)
+  m  <- names(tt)[tt == tt[1L]]
+  if (length(m) > 1L) m[which.max(nchar(m))] else m[1L]
+}
+psc4_titles <- psc_raw[!is.na(psc_4),
+  .(psc_2 = data.table::first(psc_2), psc_title = mode_title(product_and_service_code_name)),
+  by = psc_4]
+psc2_titles <- psc4_titles[, .(title2 = str_squish(paste(unique(psc_title), collapse = " "))), by = psc_2]
+setnames(psc2_titles, "psc_2", "psc2")
+
+prep_texts <- function(x) {x <- tolower(x); x <- str_replace_all(x, "[^[:alnum:]\\s\\-_/]", " "); str_squish(x)}
+q_text <- prep_texts(desc_tbl$q)
+t_text <- prep_texts(psc2_titles$title2)
+psc2_vec <- psc2_titles$psc2
+
+bm25_build_safe <- function(texts) {
+  bm <- try(rbm25::BM25$new(texts), silent = TRUE)
+  if (inherits(bm, "try-error")) bm <- try(rbm25::BM25$new(corpus = texts), silent = TRUE)
+  if (inherits(bm, "try-error")) bm <- NULL
+  bm
+}
+bm25_query_raw <- function(bm, query, corpus_texts) {
+  if (!is.null(bm)) {
+    res <- try(bm$query(query), silent = TRUE)
+    if (!inherits(res, "try-error")) return(res)
+    res <- try(bm$score(query), silent = TRUE)
+    if (!inherits(res, "try-error")) return(res)
+  }
+  rbm25::bm25_score(data = corpus_texts, query = query)
+}
+coerce_scores_vec <- function(s, n_target) {
+  if (is.null(s)) return(rep(0, n_target))
+  if (is.numeric(s)) v <- s else if (inherits(s, "dgCMatrix") || is.matrix(s)) v <- as.numeric(s) else if (is.data.frame(s)) {
+    numcols <- which(vapply(s, is.numeric, logical(1)))
+    v <- if (length(numcols)) as.numeric(s[[ numcols[1] ]]) else suppressWarnings(as.numeric(unlist(s, use.names = FALSE)))
+  } else if (is.list(s)) {
+    cand <- s[c("score","scores","bm25","bm25_score")]
+    cand <- cand[!vapply(cand, is.null, logical(1))]
+    v <- if (length(cand)) as.numeric(cand[[1]]) else suppressWarnings(as.numeric(unlist(s, use.names = FALSE)))
+  } else v <- suppressWarnings(as.numeric(s))
+  v[!is.finite(v)] <- 0
+  len <- length(v)
+  if (len == n_target) return(v)
+  if (len >  n_target) return(v[seq_len(n_target)])
+  c(v, rep(0, n_target - len))
+}
+bm <- bm25_build_safe(t_text)
+n_docs <- length(psc2_vec)
+w <- max(2L, future::nbrOfWorkers())
+nq <- length(q_text)
+target_tasks <- w * 4L
+chunk_rows_bm25 <- max(2000L, floor(nq / target_tasks))
+idx <- split(seq_len(nq), ceiling(seq_len(nq) / chunk_rows_bm25))
+progressr::handlers("none")
+sim_topk_list <- future_lapply(
+  seq_along(idx),
+  function(i){
+    data.table::setDTthreads(1L)
+    Sys.setenv(MKL_NUM_THREADS = "1", OMP_NUM_THREADS = "1")
+    ii  <- idx[[i]]
+    res <- vector("list", length(ii))
+    for (j in seq_along(ii)) {
+      s_raw <- bm25_query_raw(bm, q_text[ii[j]], t_text)
+      s_num <- coerce_scores_vec(s_raw, n_docs)
+      names(s_num) <- psc2_vec
+      pos <- which(s_num > 0)
+      if (length(pos)) {
+        ord    <- head(order(s_num[pos], decreasing = TRUE), K_text)
+        picked <- names(s_num[pos])[ord]
+        res[[j]] <- data.table(pair_key = desc_tbl$pair_key[ii[j]], psc2 = picked, bm25 = as.numeric(s_num[picked]), rank = seq_along(picked))
+      } else {
+        res[[j]] <- data.table(pair_key = desc_tbl$pair_key[ii[j]], psc2 = NA_character_, bm25 = NA_real_, rank = NA_integer_)
+      }
+    }
+    rbindlist(res, use.names = TRUE, fill = TRUE)
+  },
+  future.seed = TRUE
+)
+sim_topk_bm25 <- rbindlist(sim_topk_list, use.names = TRUE, fill = TRUE)
+sim_topk_bm25 <- sim_topk_bm25[!is.na(psc2) & is.finite(bm25)]
+setkey(sim_topk_bm25, pair_key, psc2)
+bm25_vals <- sim_topk_bm25$bm25
+bm25_vals <- bm25_vals[is.finite(bm25_vals)]
+q_lo_bm  <- as.numeric(quantile(bm25_vals, 0.01,  na.rm = TRUE))
+q_hi_bm  <- as.numeric(quantile(bm25_vals, 0.999, na.rm = TRUE))
+clip_vec <- function(x, lo, hi) pmin(pmax(x, lo), hi)
+bm25_clip <- clip_vec(sim_topk_bm25$bm25, q_lo_bm, q_hi_bm)
+log_lo_bm <- log1p(q_lo_bm)
+log_hi_bm <- log1p(q_hi_bm)
+log_rng_bm <- (log_hi_bm - log_lo_bm); if (log_rng_bm <= 0) log_rng_bm <- max(1, abs(log_hi_bm))
+sim_topk_bm25[, bm25_log := (log1p(bm25_clip) - log_lo_bm) / log_rng_bm]
+
+corp_q <- corpus(q_text)
+corp_p <- corpus(t_text)
+toks_q <- tokens(corp_q, remove_punct = TRUE)
+toks_p <- tokens(corp_p, remove_punct = TRUE)
+toks_q <- tokens_tolower(toks_q)
+toks_p <- tokens_tolower(toks_p)
+toks_q <- tokens_remove(toks_q, stopwords("en"))
+toks_p <- tokens_remove(toks_p, stopwords("en"))
+dfm_q <- dfm(toks_q)
+dfm_p <- dfm(toks_p)
+W2V_MATRIX_PATH <- here("runs","psc","outputs","w2v_bigrams_matrix.rds")
+docnames(toks_q) <- paste0("q_", seq_len(quanteda::ndoc(toks_q)))
+docnames(toks_p) <- paste0("p_", seq_len(quanteda::ndoc(toks_p)))
+toks_all <- c(toks_q, toks_p)
+load_or_train_w2v <- function(path, toks, dim, window, min_count, neg, subsample, epochs) {
+  if (file.exists(path)) {
+    m <- readRDS(path)
+    if (is.matrix(m) && length(rownames(m))) return(m)
+  }
+  mdl <- wordvector::textmodel_word2vec(x = toks, dim = dim, type = "skip-gram", min_count = min_count, window = window, iter = epochs, alpha = 0.025, use_ns = TRUE, ns_size = neg, verbose = TRUE)
+  m <- as.matrix(mdl, normalized = FALSE)
+  saveRDS(m, path)
+  m
+}
+w2v_mat <- load_or_train_w2v(W2V_MATRIX_PATH, toks_all, w2v_dim, w2v_window, w2v_min_count, w2v_neg, w2v_subsample, w2v_epochs)
+feat_keep <- intersect(colnames(dfm_q), rownames(w2v_mat))
+if (length(feat_keep) == 0L) {
+  w2v_mat <- load_or_train_w2v(tempfile(fileext = ".rds"), toks_all, w2v_dim, w2v_window, max(1L, floor(w2v_min_count/2)), w2v_neg, w2v_subsample, w2v_epochs)
+  feat_keep <- intersect(colnames(dfm_q), rownames(w2v_mat))
+}
+dfm_q <- quanteda::dfm_match(dfm_q, feat_keep)
+dfm_p <- quanteda::dfm_match(dfm_p, feat_keep)
+W <- w2v_mat[feat_keep, , drop = FALSE]
+l2_norm_rows <- function(Z) {nr <- sqrt(pmax(rowSums(Z^2), 1e-12)); Z / nr}
+build_Ep_once <- function(dfm_p, W) {M <- as(dfm_p, "dgCMatrix"); Z <- as.matrix(M %*% W); l2_norm_rows(Z)}
+doc_embed_chunk <- function(dfm_obj, W, idx_rows) {M <- as(dfm_obj[idx_rows, , drop = FALSE], "dgCMatrix"); Z <- as.matrix(M %*% W); l2_norm_rows(Z)}
+Ep <- build_Ep_once(dfm_p, W)
+tEp <- t(Ep)
+topk_cosine_stream2 <- function(dfm_q, W, pair_keys, psc2_vec, k = 5L, chunk_rows = 25000L){
+  n <- nrow(dfm_q)
+  if (is.null(n) || n == 0L) return(data.table(pair_key=character(), psc2=character(), emb=numeric(), rank=integer()))
+  idx <- split(seq_len(n), ceiling(seq_len(n) / chunk_rows))
+  eq_list <- lapply(idx, function(ii) doc_embed_chunk(dfm_q, W, ii))
+  pk_list <- lapply(idx, function(ii) pair_keys[ii])
+  out <- future.apply::future_lapply(seq_along(eq_list), function(i){
+    Eq_i <- eq_list[[i]]
+    pk_i <- pk_list[[i]]
+    S <- Eq_i %*% tEp
+    res <- vector("list", nrow(S))
+    for (r in seq_len(nrow(S))) {
+      s <- S[r,]
+      ord <- head(order(s, decreasing = TRUE), k)
+      res[[r]] <- data.table(pair_key = pk_i[r], psc2 = psc2_vec[ord], emb = as.numeric(s[ord]), rank = seq_along(ord))
+    }
+    data.table::rbindlist(res, use.names = TRUE)
+  }, future.seed = TRUE, future.globals = c("tEp","psc2_vec","K_text"))
+  data.table::rbindlist(out, use.names = TRUE)
+}
+sim_topk_emb <- topk_cosine_stream2(dfm_q, W, desc_tbl$pair_key, psc2_vec, k = K_text, chunk_rows = chunk_rows)
+setDT(sim_topk_emb)
+sim_topk_emb <- sim_topk_emb[, .(emb = max(emb, na.rm = TRUE), rank = min(rank, na.rm = TRUE)), by = .(pair_key, psc2)]
+setkey(sim_topk_emb, pair_key, psc2)
+emb_vals <- sim_topk_emb$emb
+emb_vals <- emb_vals[is.finite(emb_vals)]
+q_lo_e  <- as.numeric(quantile(emb_vals, 0.01,  na.rm = TRUE))
+q_hi_e  <- as.numeric(quantile(emb_vals, 0.999, na.rm = TRUE))
+emb_clip <- clip_vec(sim_topk_emb$emb, q_lo_e, q_hi_e)
+log_lo_e <- log1p(q_lo_e)
+log_hi_e <- log1p(q_hi_e)
+log_rng_e <- (log_hi_e - log_lo_e); if (log_rng_e <= 0) log_rng_e <- max(1, abs(log_hi_e))
+sim_topk_emb[, emb_log := (log1p(emb_clip) - log_lo_e) / log_rng_e]
+
+N_add <- 3L
+TH_NAICS <- 0.10
+TH_UEI   <- 0
+TH_API   <- 0.15
+pri_top_naics <- p_naics[, .SD[order(-p_naics)][1L:N_add], by = pair_key][p_naics >= TH_NAICS]
+pri_top_uei   <- p_uei  [, .SD[order(-p_uei  )][1L:N_add], by = pair_key][p_uei   >= TH_UEI]
+pri_top_api   <- api_family[, .SD[order(-api_p)][1L:N_add], by = pair_key][api_p >= TH_API]
+cand_bm25 <- unique(sim_topk_bm25[, .(pair_key, psc2)])
+cand_emb  <- unique(sim_topk_emb [, .(pair_key, psc2)])
+cand_naic <- unique(pri_top_naics[, .(pair_key, psc2)])
+cand_uei  <- unique(pri_top_uei  [, .(pair_key, psc2)])
+cand_api  <- unique(pri_top_api  [, .(pair_key, psc2)])
+candidates <- unique(rbindlist(list(cand_bm25, cand_emb, cand_naic, cand_uei, cand_api), use.names = TRUE, fill = TRUE))
+setkey(candidates, pair_key, psc2)
+
+feat <- merge(candidates, sim_topk_bm25[, .(pair_key, psc2, bm25_log)], by = c("pair_key","psc2"), all.x = TRUE)
+feat <- merge(feat,        sim_topk_emb [, .(pair_key, psc2, emb_log )], by = c("pair_key","psc2"), all.x = TRUE)
+feat <- merge(feat,        p_naics      [, .(pair_key, psc2, p_naics)], by = c("pair_key","psc2"), all.x = TRUE)
+feat <- merge(feat,        p_uei        [, .(pair_key, psc2, p_uei  )], by = c("pair_key","psc2"), all.x = TRUE)
+feat <- merge(feat,        api_family   [, .(pair_key, psc2, api_p  )], by = c("pair_key","psc2"), all.x = TRUE)
+feat[is.na(bm25_log), bm25_log := 0]
+feat[is.na(emb_log),  emb_log  := 0]
+feat[is.na(p_naics),  p_naics  := 0]
+feat[is.na(p_uei),    p_uei    := 0]
+feat[is.na(api_p),    api_p    := 0]
+
+
+
+w_uei  <- 0.80
+w_bm25 <- 0.60
+w_naic <- 0.50
+w_api  <- 0.50
+w_emb  <- 0.20
+
+# soft gate for BM25: full weight above threshold, reduced weight below
+BM25_TH    <- 0.20   # threshold on bm25_log
+BM25_FLOOR <- 0.15   # fraction of bm25_log to keep when below threshold (e.g., 15%)
+
+feat[, bm25_eff := fifelse(bm25_log >= BM25_TH, bm25_log, bm25_log * BM25_FLOOR)]
+
+
+feat[, score := w_uei*p_uei + w_bm25*bm25_eff + w_naic*p_naics + w_api*api_p + w_emb*emb_log]
+
+
+setorder(feat, pair_key, -score)
+feat[, rank := seq_len(.N), by = pair_key]
+feat[, margin := score[1L] - score[pmin(2L, .N)], by = pair_key]
+
+family_scores <- feat[rank <= 5L, .(pair_key, psc2, bm25_log, emb_log, p_naics, p_uei, api_p, score, rank, margin)]
+family_pick   <- family_scores[, .SD[1L:min(.N, 5L)], by = pair_key]
+setorder(family_pick, pair_key, rank)
+```
+
+
+```{r}
+family_pick <- family_pick %>%  
+  left_join(map_titles)
+
+
+family_pick1 <- family_pick %>%  
+  left_join(desc_tbl %>%  
+              group_by(pair_key) %>%  
+              slice_head(n= 1) %>%  
+              select(pair_key, q), join_by(pair_key))
+
+
+family_pick1 <- family_pick1[1:1000,]
+
+
+write_csv(family_pick1, "family_pick.csv")
+
+pred_cols <- c("bm25_log","emb_log","p_naics","p_uei","api_p")
+missing <- setdiff(pred_cols, names(feat))
+if (length(missing)) stop(sprintf("feat is missing columns: %s", paste(missing, collapse=", ")))
+
+DT <- copy(feat)[, ..pred_cols]
+for (cn in pred_cols) set(DT, i = which(!is.finite(DT[[cn]])), j = cn, value = NA_real_)
+
+DT_long <- melt(DT, measure.vars = pred_cols, variable.name = "predictor", value.name = "val", variable.factor = TRUE)
+DT_long[, predictor := factor(predictor, levels = c("p_uei","bm25_log","p_naics","api_p","emb_log"))]
+
+p <- ggplot(DT_long[!is.na(val), rank ==1 ], aes(x = val)) +
+  geom_histogram(bins = 50, color = "white") +
+  coord_cartesian(xlim = c(0, 1)) +
+  scale_x_continuous(labels = label_number(accuracy = 0.05)) +
+  labs(title = "Predictor distributions", x = "value (0–1)", y = "count") +
+  theme_minimal(base_size = 13) +
+  facet_wrap(~ predictor, ncol = 2, scales = "free_y")
+print(p)
+
+
+
+
+
+```
+ 
