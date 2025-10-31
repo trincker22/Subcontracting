@@ -1,0 +1,341 @@
+---
+title: "glmnet"
+output: html_document
+date: "2025-10-30"
+---
+
+
+```{r}
+
+library(data.table)
+library(text2vec)
+library(Matrix)
+library(glmnet)
+library(here)
+library(arrow)
+
+
+usa_base <- read_parquet(here("Data", "validation", "usa_base.parquet"))
+stopifnot(exists("usa_base"))
+if (!is.data.table(usa_base)) setDT(usa_base)
+
+setDTthreads(percent = 100)
+
+save_dir  <- here("Data","validation")
+model_dir <- file.path(save_dir, "Models")
+dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+
+clean_text_vec <- function(x) {
+  x <- as.character(x)
+  x[is.na(x)] <- ""
+  x <- tolower(x)
+  x <- sub("^\\s*\\d+\\s*\\!\\s*", "", x)
+  x <- gsub("[^[:alnum:]\\s\\-_/]", " ", x)
+  x <- gsub("\\s+", " ", x)
+  trimws(x)
+}
+
+build_vocab_if_needed <- function(ds, text_col, vocab_path, sample_n = 1e6L) {
+  if (file.exists(vocab_path)) return(readRDS(vocab_path))
+  n <- nrow(ds)
+  k <- min(as.integer(sample_n), n)
+  idx <- sample.int(n, k)
+  txt <- clean_text_vec(ds[[text_col]][idx])
+  txt <- txt[nzchar(txt)]
+  it  <- text2vec::itoken(txt, tokenizer = text2vec::word_tokenizer, progressbar = FALSE)
+  vocab <- text2vec::create_vocabulary(it, ngram = c(1L, 2L))
+  vocab <- text2vec::prune_vocabulary(vocab, term_count_min = 50, doc_proportion_max = 0.02)
+  saveRDS(vocab, vocab_path)
+  vocab
+}
+
+prefit_idf_named <- function(ds, text_col, vectorizer, idf_path, sample_n = 2e6L) {
+  if (file.exists(idf_path)) return(readRDS(idf_path))
+  n <- nrow(ds)
+  k <- min(as.integer(sample_n), n)
+  idx <- sample.int(n, k)
+  txt <- clean_text_vec(ds[[text_col]][idx])
+  txt <- txt[nzchar(txt)]
+  it  <- text2vec::itoken(txt, tokenizer = text2vec::word_tokenizer, progressbar = FALSE)
+  dtm <- text2vec::create_dtm(it, vectorizer)
+  df  <- Matrix::colSums(dtm > 0)
+  idf <- log1p(nrow(dtm) / (1 + df))
+  names(idf) <- colnames(dtm)
+  saveRDS(idf, idf_path)
+  idf
+}
+
+tfidf_apply_dgc <- function(dtm, idf_named) {
+  if (!inherits(dtm, "dgCMatrix")) dtm <- as(dtm, "dgCMatrix")
+  rs <- Matrix::rowSums(dtm)
+  rs[rs == 0] <- 1
+  row_idx <- dtm@i + 1L
+  tf <- dtm
+  tf@x <- tf@x / rs[row_idx]
+  idf_aligned <- idf_named[colnames(tf)]
+  if (!is.numeric(idf_aligned) || any(is.na(idf_aligned))) {
+    idf_aligned <- rep(log1p(nrow(tf)), ncol(tf))
+    names(idf_aligned) <- colnames(tf)
+  }
+  tf %*% Matrix::Diagonal(x = idf_aligned)
+}
+
+
+add_missing_cols <- function(M, target_cols) {
+  miss <- setdiff(target_cols, colnames(M))
+  if (!length(miss)) return(M)
+  Z <- Matrix::sparseMatrix(i = integer(0), j = integer(0), x = numeric(0),
+                            dims = c(nrow(M), length(miss)),
+                            dimnames = list(NULL, miss))
+  Matrix::cbind2(M, Z)
+}
+
+reorder_cols <- function(M, target_cols) M[, target_cols, drop = FALSE]
+
+rbind_sparse_align <- function(A, B) {
+  if (is.null(A)) return(B)
+  ca <- colnames(A); cb <- colnames(B)
+  if (is.null(ca) || is.null(cb)) return(Matrix::rbind2(A, B))
+  allc <- union(ca, cb)
+  A2 <- reorder_cols(add_missing_cols(A, allc), allc)
+  B2 <- reorder_cols(add_missing_cols(B, allc), allc)
+  Matrix::rbind2(A2, B2)
+}
+
+build_full_tfidf <- function(ds, text_col, label_col, vectorizer, idf_named, batch_size = 100000L) {
+  n <- nrow(ds)
+  starts <- seq.int(1L, n, by = batch_size)
+  X_all <- NULL
+  y_all <- character(0)
+  for (s in starts) {
+    e <- min(s + batch_size - 1L, n)
+    q <- clean_text_vec(ds[[text_col]][s:e])
+    keep <- nzchar(q)
+    if (!any(keep)) next
+    q <- q[keep]
+    y <- substr(as.character(ds[[label_col]][s:e][keep]), 1, 2)
+    keep2 <- nzchar(y)
+    if (!any(keep2)) next
+    q <- q[keep2]
+    y <- y[keep2]
+    it  <- text2vec::itoken(q, tokenizer = text2vec::word_tokenizer, progressbar = FALSE)
+    dtm <- text2vec::create_dtm(it, vectorizer)
+    if (nrow(dtm) == 0L || ncol(dtm) == 0L) next
+    tfidf <- tfidf_apply_dgc(dtm, idf_named)
+    nnz <- diff(tfidf@p)
+    if (!any(nnz > 0L)) next
+    tfidf <- tfidf[nnz > 0L, , drop = FALSE]
+    y <- y[nnz > 0L]
+    X_all <- rbind_sparse_align(X_all, tfidf)
+    y_all <- c(y_all, y)
+    rm(q, y, it, dtm, tfidf, nnz)
+    gc()
+  }
+  if (is.null(X_all) || length(y_all) == 0L) stop("No data collected into X_all / y_all")
+  list(X = X_all, y = factor(y_all))
+}
+
+finalize_labels <- function(y, min_per_class = 2L, top_k_fallback = 10L) {
+  tab <- sort(table(y), decreasing = TRUE)
+  keep <- names(tab)[tab >= min_per_class]
+  if (length(keep) < 2L) keep <- head(names(tab), 2L)
+  y_eff <- ifelse(y %in% keep, as.character(y), "OTHER")
+  y_eff <- factor(y_eff, levels = unique(c(keep, "OTHER")))
+  tab2 <- table(y_eff)
+  if (any(tab2 < min_per_class)) {
+    rare <- names(tab2)[tab2 < min_per_class]
+    if (setequal(rare, "OTHER")) {
+      keep2 <- head(names(sort(table(y), decreasing = TRUE)), max(2L, top_k_fallback))
+      y_eff <- factor(ifelse(y %in% keep2, as.character(y), "OTHER"), levels = unique(c(keep2, "OTHER")))
+    }
+  }
+  if (nlevels(y_eff) < 2L) {
+    keep2 <- head(names(sort(table(y), decreasing = TRUE)), 2L)
+    y_eff <- factor(ifelse(y %in% keep2, as.character(y), NA_character_), levels = keep2)
+  }
+  y_eff
+}
+
+vocab_path <- file.path(model_dir, "vocab_only.rds")
+idf_path   <- file.path(model_dir, "idf_named.rds")
+
+vocabulary <- build_vocab_if_needed(usa_base, "q", vocab_path, sample_n = 1e6L)
+vectorizer <- text2vec::vocab_vectorizer(vocabulary)
+idf_named  <- prefit_idf_named(usa_base, "q", vectorizer, idf_path, sample_n = 2e6L)
+
+full <- build_full_tfidf(usa_base, "q", "psc2_true", vectorizer, idf_named, batch_size = 100000L)
+X_all <- full$X
+y_all <- droplevels(full$y)
+
+y_eff <- finalize_labels(y_all, min_per_class = 2L, top_k_fallback = 10L)
+keep_idx <- !is.na(y_eff)
+X_all <- X_all[keep_idx, , drop = FALSE]
+y_eff <- droplevels(y_eff[keep_idx])
+
+X_all <- as(X_all, "dgCMatrix")
+zr <- Matrix::rowSums(X_all) == 0
+if (any(zr)) {
+  X_all <- X_all[!zr, , drop = FALSE]
+  y_eff <- droplevels(y_eff[!zr])
+}
+zc <- Matrix::colSums(X_all) == 0
+if (any(zc)) X_all <- X_all[, !zc, drop = FALSE]
+
+tab <- table(y_eff)
+if (any(tab < 2L)) {
+  keep <- names(tab)[tab >= 2L]
+  if (length(keep) < 2L) {
+    ord <- names(sort(tab, decreasing = TRUE))
+    keep <- ord[seq_len(min(2L, length(ord)))]
+  }
+  y_eff <- factor(ifelse(as.character(y_eff) %in% keep, as.character(y_eff), "OTHER"), levels = unique(c(keep, "OTHER")))
+  y_eff <- droplevels(y_eff)
+  tab <- table(y_eff)
+}
+
+stopifnot(nrow(X_all) == length(y_eff), length(tab) >= 2L, all(tab >= 2L))
+
+w <- setNames(1 / as.numeric(tab), names(tab))
+w_vec <- as.numeric(w[as.character(y_eff)])
+
+
+set.seed(42)
+
+N <- nrow(X_all)
+n_sub <- min(200000L, N)
+
+idx_by_cls <- split(seq_len(N), y_eff)
+sizes <- vapply(idx_by_cls, length, integer(1))
+
+target <- ceiling((as.numeric(sizes) / as.numeric(N)) * as.numeric(n_sub))
+target <- pmax(1L, pmin(target, sizes))
+
+take_by_cls <- Map(function(ix, k) if (k <= 0L) integer(0) else sample(ix, size = k),
+                   idx_by_cls, target)
+
+sample_idx <- unlist(take_by_cls, use.names = FALSE)
+
+X_sub <- X_all[sample_idx, , drop = FALSE]
+y_sub <- y_eff[sample_idx]
+
+
+
+
+set.seed(42)
+
+tab_sub <- table(y_sub)
+w_sub <- setNames(1 / as.numeric(tab_sub), names(tab_sub))
+w_vec_sub <- as.numeric(w_sub[as.character(y_sub)])
+
+library(doParallel)
+cl <- makeCluster(4)  
+registerDoParallel(cl)
+
+cvfit <- cv.glmnet(
+  X_sub, y_sub,
+  family = "multinomial",
+  alpha = 1,
+  standardize = FALSE,
+  weights = w_vec_sub,
+  nfolds = 5,
+  parallel = TRUE
+)
+
+stopCluster(cl)
+
+
+
+# --- CV with settings that help convergence and allow more features to enter ---
+set.seed(42)
+cvfit <- cv.glmnet(
+  X_sub, y_sub,
+  family = "multinomial",
+  alpha  = 0.5,                 # elastic-net to let correlated tokens enter together
+  standardize = TRUE,           # helps conditioning
+  weights = w_vec_sub,
+  type.measure = "deviance",
+  nfolds = 5,
+  nlambda = 70,                 # fewer, better-behaved lambdas
+  lambda.min.ratio = 1e-3,      # avoid the tiniest (hard-to-converge) lambdas
+  maxit = 2e5,                  # give the solver more room
+  parallel = T              # set to TRUE only if you registered a backend
+)
+
+# --- Pick a lambda that yields MORE active features but stays near the CV minimum ---
+target_nnz <- 800L
+idx <- which.min(abs(cvfit$nzero - target_nnz))
+lambda_target <- cvfit$lambda[idx]
+
+# Safety: don’t go smaller than lambda.min (if you want “more than min”, use a % step left of 1se)
+if (lambda_target < min(cvfit$lambda)) {
+  lambda_target <- cvfit$lambda.min
+}
+
+# Option B: a principled “slightly denser than 1SE” choice:
+# take the geometric mean between lambda.1se and the next smaller lambda on the path
+i1se <- match(cvfit$lambda.1se, cvfit$lambda)
+if (!is.na(i1se) && i1se < length(cvfit$lambda)) {
+  lambda_target <- sqrt(cvfit$lambda[i1se] * cvfit$lambda[i1se + 1L])
+}
+
+# --- Final refit at chosen lambda on ALL data ---
+final_fit <- glmnet(
+  X_all, y_eff,
+  family = "multinomial",
+  alpha  = 0.5,
+  standardize = TRUE,
+  lambda = lambda_target,
+  weights = w_vec,
+  maxit = 2e5
+)
+
+
+
+cvfit <- cv.glmnet(
+  X_sub, y_sub,
+  family = "multinomial",
+  alpha = 1,
+  standardize = FALSE,
+  weights = w_vec_sub,
+  type.measure = "class",
+  nfolds = 5,
+  parallel = FALSE
+)
+
+lambda_star <- cvfit$lambda.1se
+
+final_model <- glmnet(
+  X_all, y_eff,
+  family = "multinomial",
+  alpha = 1,
+  standardize = FALSE,
+  lambda = lambda_star,
+  weights = w_vec
+)
+
+
+
+saveRDS(cvfit, file.path(model_dir, "lasso_psc2_multinomial_cv.rds"))
+saveRDS(list(vocabulary = vocabulary, idf_names = names(idf_named), levels = levels(y_eff)), file.path(model_dir, "model_artifacts_psc2.rds"))
+
+
+
+
+
+
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+

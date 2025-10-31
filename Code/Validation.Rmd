@@ -1,0 +1,1351 @@
+---
+title: "Validation"
+output: html_document
+date: "2025-10-28"
+---
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(janitor)
+library(readxl)
+library(arrow)
+library(here)
+library(quanteda)
+library(Matrix)
+library(future)
+library(future.apply)
+library(progressr)
+library(digest)
+
+
+
+setDTthreads(percent = 100)
+plan(multisession, workers = max(2L, parallel::detectCores() - 1L))
+handlers("txtprogressbar")
+
+K_text <- 5L
+chunk_rows <- 25000L
+half_life_days <- 730
+alpha0 <- 10
+w2v_dim <- 200L
+w2v_window <- 5L
+w2v_min_count <- 20L
+w2v_neg <- 10L
+w2v_subsample <- 1e-5
+w2v_epochs <- 10L
+
+validation_path <- here("Data", "validation")
+dir.create(validation_path, recursive = TRUE, showWarnings = FALSE)
+
+
+if (!file.exists(here("Data", "validation", "usa_base.parquet"))) {
+  
+dod_ds <- open_dataset(here("Data","Prior","RawCSV"), format = "csv")
+keep_cols <- c("transaction_description","product_or_service_code","recipient_uei","naics_code","action_date")
+usa_raw <- dod_ds |> select(all_of(keep_cols)) |> collect()
+
+
+# usa_raw <- usa_raw %>%  
+#   sample_n(100000)
+
+setDT(usa_raw)
+usa_raw[, transaction_description := as.character(transaction_description)]
+usa_raw[, product_or_service_code := as.character(product_or_service_code)]
+usa_raw[, recipient_uei := as.character(recipient_uei)]
+usa_raw[, naics_code := as.character(naics_code)]
+usa_raw[, action_date := as.character(action_date)]
+usa_raw <- usa_raw[!is.na(transaction_description) & nzchar(transaction_description)]
+usa_raw[, q_raw := transaction_description]
+usa_raw[, q := tolower(q_raw)]
+usa_raw[, q := sub("^\\s*\\d+\\s*\\!\\s*", "", q)]
+usa_raw[, q := str_replace_all(q, "[^[:alnum:]\\s\\-_/]", " ")]
+usa_raw[, q := str_squish(q)]
+usa_raw[, psc4_true := toupper(substr(gsub("[^A-Za-z0-9]", "", product_or_service_code), 1, 4))]
+usa_raw[, psc2_true := substr(psc4_true, 1, 2)]
+usa_raw <- usa_raw[nchar(psc2_true) == 2]
+usa_raw[, UEI := toupper(str_squish(recipient_uei))]
+usa_raw[, UEI := ifelse(nzchar(UEI), UEI, NA_character_)]
+usa_raw[, naics6 := substr(gsub("[^0-9]", "", naics_code), 1, 6)]
+usa_raw[, naics6 := ifelse(nchar(naics6) == 6, naics6, NA_character_)]
+usa_raw[, pair_key_test := vapply(paste(q, ifelse(is.na(UEI), "", UEI), sep = "~"), digest, "", algo = "xxhash64")]
+
+u <- unique(usa_raw$q)
+usa_raw[, query_id_test := data.table::chmatch(q, u)]
+
+# usa_raw[, query_id_test := vapply(q, digest, "", algo = "xxhash64")]
+
+usa_base <- unique(usa_raw[, .(pair_key_test, query_id_test, q, UEI, naics6, psc2_true, action_date)])
+write_parquet(usa_base, here("Data", "validation", "usa_base.parquet"))
+
+} else {
+  usa_base <- read_parquet(here("Data", "validation", "usa_base.parquet")) }
+
+
+usa_base <- usa_base %>%  
+  sample_n(200000)
+
+read_psc_2025 <- function(path, sheet = 1) {
+  hdr <- read_xlsx(path, sheet = sheet, n_max = 0)
+  ct <- rep("guess", length(hdr)); ct[1] <- "text"
+  read_xlsx(path, sheet = sheet, col_types = ct, .name_repair = "minimal") |>
+    clean_names() |>
+    transform(psc_code = {x <- as.character(psc_code); x <- str_squish(x); sub("^(\\d+)\\.0+$", "\\1", x)})
+}
+psc_raw <- read_psc_2025(here("Data","PSC0425.xlsx"))
+setDT(psc_raw)
+psc_raw[, psc_code := toupper(trimws(psc_code))]
+psc_raw[, psc_2 := substr(psc_code, 1, 2)]
+psc_raw[, psc_4 := ifelse(nchar(psc_code) == 4, psc_code, NA_character_)]
+mode_title <- function(x) {
+  x <- str_squish(str_to_sentence(as.character(x)))
+  x <- x[!is.na(x) & nzchar(x)]
+  if (!length(x)) return(NA_character_)
+  tt <- sort(table(x), decreasing = TRUE)
+  m  <- names(tt)[tt == tt[1L]]
+  if (length(m) > 1L) m[which.max(nchar(m))] else m[1L]
+}
+psc4_titles <- psc_raw[!is.na(psc_4), .(psc_2 = data.table::first(psc_2), psc_title = mode_title(product_and_service_code_name)), by = psc_4]
+psc2_titles <- psc4_titles[, .(title2 = str_squish(paste(unique(psc_title), collapse = " "))), by = psc_2]
+setnames(psc2_titles, "psc_2", "psc2")
+t_text <- tolower(psc2_titles$title2)
+t_text <- str_replace_all(t_text, "[^[:alnum:]\\s\\-_/]", " ")
+t_text <- str_squish(t_text)
+psc2_vec <- psc2_titles$psc2
+corp_p <- corpus(t_text)
+toks_p <- tokens(corp_p, remove_punct = TRUE)
+toks_p <- tokens_tolower(toks_p)
+toks_p <- tokens_remove(toks_p, stopwords("en"))
+dfm_p <- dfm(toks_p)
+
+q_text <- tolower(usa_base$q)
+q_text <- str_replace_all(q_text, "[^[:alnum:]\\s\\-_/]", " ")
+q_text <- str_squish(q_text)
+corp_q <- corpus(q_text)
+toks_q <- tokens(corp_q, remove_punct = TRUE)
+toks_q <- tokens_tolower(toks_q)
+toks_q <- tokens_remove(toks_q, stopwords("en"))
+dfm_q <- dfm(toks_q)
+
+bm25_build_safe <- function(texts) {
+  bm <- try(rbm25::BM25$new(texts), silent = TRUE)
+  if (inherits(bm, "try-error")) bm <- try(rbm25::BM25$new(corpus = texts), silent = TRUE)
+  if (inherits(bm, "try-error")) bm <- NULL
+  bm
+}
+bm25_query_raw <- function(bm, query, corpus_texts) {
+  if (!is.null(bm)) {
+    res <- try(bm$query(query), silent = TRUE)
+    if (!inherits(res, "try-error")) return(res)
+    res <- try(bm$score(query), silent = TRUE)
+    if (!inherits(res, "try-error")) return(res)
+  }
+  rbm25::bm25_score(data = corpus_texts, query = query)
+}
+coerce_scores_vec <- function(s, n_target) {
+  if (is.null(s)) return(rep(0, n_target))
+  if (is.numeric(s)) v <- s else if (inherits(s, "dgCMatrix") || is.matrix(s)) v <- as.numeric(s) else if (is.data.frame(s)) {
+    numcols <- which(vapply(s, is.numeric, logical(1)))
+    v <- if (length(numcols)) as.numeric(s[[ numcols[1] ]]) else suppressWarnings(as.numeric(unlist(s, use.names = FALSE)))
+  } else if (is.list(s)) {
+    cand <- s[c("score","scores","bm25","bm25_score")]
+    cand <- cand[!vapply(cand, is.null, logical(1))]
+    v <- if (length(cand)) as.numeric(cand[[1]]) else suppressWarnings(as.numeric(unlist(s, use.names = FALSE)))
+  } else v <- suppressWarnings(as.numeric(s))
+  v[!is.finite(v)] <- 0
+  len <- length(v)
+  if (len == n_target) return(v)
+  if (len >  n_target) return(v[seq_len(n_target)])
+  c(v, rep(0, n_target - len))
+}
+bm <- bm25_build_safe(t_text)
+n_docs <- length(psc2_vec)
+w <- max(2L, future::nbrOfWorkers())
+nq <- length(q_text)
+target_tasks <- w * 4L
+chunk_rows_bm25 <- max(2000L, floor(nq / target_tasks))
+idx_b <- split(seq_len(nq), ceiling(seq_len(nq) / chunk_rows_bm25))
+
+sim_topk_bm25 <- future_lapply(
+  seq_along(idx_b),
+  function(i){
+    data.table::setDTthreads(1L)
+    Sys.setenv(MKL_NUM_THREADS = "1", OMP_NUM_THREADS = "1")
+    ii  <- idx_b[[i]]
+    res <- vector("list", length(ii))
+    for (j in seq_along(ii)) {
+      s_raw <- bm25_query_raw(bm, q_text[ii[j]], t_text)
+      s_num <- coerce_scores_vec(s_raw, n_docs)
+      names(s_num) <- psc2_vec
+      pos <- which(is.finite(s_num) & s_num > 0)
+      if (length(pos)) {
+        ord <- head(order(s_num[pos], decreasing = TRUE), K_text)
+        picked <- names(s_num[pos])[ord]
+        res[[j]] <- data.table(pair_key_test = usa_base$pair_key_test[ii[j]], psc2 = picked, bm25 = as.numeric(s_num[picked]), rank = seq_along(picked))
+      } else {
+        res[[j]] <- data.table(pair_key_test = usa_base$pair_key_test[ii[j]], psc2 = NA_character_, bm25 = NA_real_, rank = NA_integer_)
+      }
+    }
+    rbindlist(res, use.names = TRUE, fill = TRUE)
+  },
+  future.seed = TRUE
+) |> rbindlist(use.names = TRUE, fill = TRUE)
+
+sim_topk_bm25 <- sim_topk_bm25[!is.na(psc2) & is.finite(bm25)]
+setkey(sim_topk_bm25, pair_key_test, psc2)
+bm25_vals <- sim_topk_bm25$bm25
+bm25_vals <- bm25_vals[is.finite(bm25_vals)]
+q_lo_bm  <- as.numeric(quantile(bm25_vals, 0.01,  na.rm = TRUE))
+q_hi_bm  <- as.numeric(quantile(bm25_vals, 0.999, na.rm = TRUE))
+clip_vec <- function(x, lo, hi) pmin(pmax(x, lo), hi)
+bm25_clip <- clip_vec(sim_topk_bm25$bm25, q_lo_bm, q_hi_bm)
+log_lo_bm <- log1p(q_lo_bm)
+log_hi_bm <- log1p(q_hi_bm)
+log_rng_bm <- (log_hi_bm - log_lo_bm); if (log_rng_bm <= 0) log_rng_bm <- max(1, abs(log_hi_bm))
+sim_topk_bm25[, bm25_log := (log1p(bm25_clip) - log_lo_bm) / log_rng_bm]
+```
+
+new embeddings
+```{r}
+
+library(data.table)
+library(arrow)
+library(quanteda)
+library(Matrix)
+library(progressr)
+library(future)
+library(future.apply)
+
+save_model_artifacts <- function(W, tEp, feat_keep, colloc, dir_path) {
+  dir.create(dir_path, recursive = TRUE, showWarnings = FALSE)
+  saveRDS(W, file.path(dir_path, "W.rds"))
+  saveRDS(tEp, file.path(dir_path, "tEp.rds"))
+  saveRDS(feat_keep, file.path(dir_path, "feat_keep.rds"))
+  saveRDS(colloc, file.path(dir_path, "colloc.rds"))
+}
+
+prepare_q_shards <- function(q_vec, pair_keys, shards_dir, shard_rows = 20000L) {
+  stopifnot(length(q_vec) == length(pair_keys))
+  dir.create(shards_dir, recursive = TRUE, showWarnings = FALSE)
+  n <- length(q_vec)
+  idx <- split(seq_len(n), ceiling(seq_len(n) / shard_rows))
+  for (i in seq_along(idx)) {
+    shard_path <- file.path(shards_dir, sprintf("shard-%05d.rds", i))
+    if (!file.exists(shard_path)) {
+      ii <- idx[[i]]
+      saveRDS(list(q = unname(q_vec[ii]), pair = unname(pair_keys[ii])), shard_path)
+    }
+  }
+  invisible(length(idx))
+}
+
+topk_cosine_stream2_resumable <- function(shards_dir,
+                                          out_dir,
+                                          artifacts_dir,
+                                          psc2_vec,
+                                          k = 5L,
+                                          workers = 6L) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  shard_files <- sort(Sys.glob(file.path(shards_dir, "shard-*.rds")))
+  done_parts <- basename(Sys.glob(file.path(out_dir, "part-*.parquet")))
+  done_idx <- as.integer(sub("^part-0*([0-9]+)\\.parquet$", "\\1", done_parts))
+  needed <- setdiff(seq_along(shard_files), done_idx)
+  if (!length(needed)) return(invisible(NULL))
+  oplan <- future::plan()
+  on.exit(future::plan(oplan), add = TRUE)
+  future::plan(multisession, workers = workers)
+  progressr::with_progress({
+    p <- progressr::progressor(steps = length(needed))
+    future.apply::future_lapply(
+      needed,
+      function(i) {
+        data.table::setDTthreads(1L)
+        Sys.setenv(MKL_NUM_THREADS = "1", OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", RCPP_PARALLEL_NUM_THREADS = "1")
+        W <- readRDS(file.path(artifacts_dir, "W.rds"))
+        tEp <- readRDS(file.path(artifacts_dir, "tEp.rds"))
+        feat_keep <- readRDS(file.path(artifacts_dir, "feat_keep.rds"))
+        colloc <- readRDS(file.path(artifacts_dir, "colloc.rds"))
+        shard <- readRDS(file.path(shards_dir, sprintf("shard-%05d.rds", i)))
+        toks_q <- tokens(corpus(shard$q), remove_punct = FALSE)
+        if (!is.null(colloc) && nrow(colloc)) toks_q <- tokens_compound(toks_q, phrase(colloc$collocation))
+        dfm_q_i <- dfm(toks_q)
+        dfm_q_i <- quanteda::dfm_match(dfm_q_i, feat_keep)
+        M_q <- as(dfm_q_i, "dgCMatrix")
+        Eq <- as.matrix(M_q %*% W)
+        nr <- sqrt(pmax(rowSums(Eq^2), 1e-12))
+        Eq <- Eq / nr
+        S <- Eq %*% tEp
+        res <- vector("list", nrow(S))
+        for (r in seq_len(nrow(S))) {
+          s <- S[r, ]
+          ord <- head(order(s, decreasing = TRUE), k)
+          res[[r]] <- data.table(pair_key_test = shard$pair[r], psc2 = psc2_vec[ord], emb = as.numeric(s[ord]), rank = seq_along(ord))
+        }
+        out <- data.table::rbindlist(res, use.names = TRUE)
+        tmp <- file.path(out_dir, sprintf("part-%05d.parquet.tmp", i))
+        fn  <- file.path(out_dir, sprintf("part-%05d.parquet", i))
+        write_parquet(as_arrow_table(out), tmp)
+        file.rename(tmp, fn)
+        rm(W, tEp, feat_keep, colloc, shard, toks_q, dfm_q_i, M_q, Eq, nr, S, res, out); gc()
+        p()
+        invisible(NULL)
+      },
+      future.seed = TRUE,
+      future.chunk.size = 1
+    )
+  })
+  invisible(NULL)
+}
+
+assemble_embeddings_dataset <- function(parts_dir,
+                                        sim_topk_out,
+                                        emb_feats_out) {
+  ds_raw <- arrow::open_dataset(parts_dir, format = "parquet")
+  sim_topk_emb <- as.data.table(collect(ds_raw))
+  setDT(sim_topk_emb)
+  sim_topk_emb <- sim_topk_emb[!is.na(psc2) & is.finite(emb)]
+  sim_topk_emb <- sim_topk_emb[, .(emb = max(emb, na.rm = TRUE), rank = min(rank, na.rm = TRUE)), by = .(pair_key_test, psc2)]
+  setkey(sim_topk_emb, pair_key_test, psc2)
+  emb_vals <- sim_topk_emb$emb
+  emb_vals <- emb_vals[is.finite(emb_vals)]
+  q_lo_e <- as.numeric(quantile(emb_vals, 0.01, na.rm = TRUE))
+  q_hi_e <- as.numeric(quantile(emb_vals, 0.999, na.rm = TRUE))
+  clip_vec <- function(x, lo, hi) pmin(pmax(x, lo), hi)
+  emb_clip <- clip_vec(sim_topk_emb$emb, q_lo_e, q_hi_e)
+  log_lo_e <- log1p(q_lo_e)
+  log_hi_e <- log1p(q_hi_e)
+  log_rng_e <- (log_hi_e - log_lo_e)
+  if (log_rng_e <= 0) log_rng_e <- max(1, abs(log_hi_e))
+  sim_topk_emb[, emb_log := (log1p(emb_clip) - log_lo_e) / log_rng_e]
+  dir.create(dirname(sim_topk_out), recursive = TRUE, showWarnings = FALSE)
+  dir.create(dirname(emb_feats_out), recursive = TRUE, showWarnings = FALSE)
+  write_dataset(as_arrow_table(sim_topk_emb[, .(pair_key_test, psc2, emb, rank)]), sim_topk_out, format = "parquet", existing_data_behavior = "overwrite")
+  write_dataset(as_arrow_table(sim_topk_emb[, .(pair_key_test, psc2, emb, emb_log)]), emb_feats_out, format = "parquet", existing_data_behavior = "overwrite")
+  invisible(sim_topk_emb)
+}
+
+
+# --- Step 1: Save read-only model artifacts
+W_PATH <- here("runs","psc","outputs","artifacts")
+save_model_artifacts(W, tEp, feat_keep, colloc, W_PATH)
+
+# --- Step 2: Shard the queries
+q_vec <- as.character(usa_base$q)
+pair_keys <- usa_base$pair_key_test
+SHARDS_DIR <- here("Data","validation","q_shards")
+prepare_q_shards(q_vec, pair_keys, SHARDS_DIR, shard_rows = 20000L)
+
+# --- Step 3: Run the parallel resumable cosine similarity (6 cores)
+PARTS_DIR <- here("Data","validation","sim_topk_emb_parts")
+topk_cosine_stream2_resumable(SHARDS_DIR, PARTS_DIR, W_PATH, psc2_vec, k = 5L, workers = 6L)
+
+# --- Step 4: Assemble final datasets
+SIM_TOPK_EMB_PATH <- here("Data","validation","sim_topk_emb.parquet")
+EMB_FEATURES_PATH <- here("Data","validation","emb_features.parquet")
+assemble_embeddings_dataset(PARTS_DIR, SIM_TOPK_EMB_PATH, EMB_FEATURES_PATH)
+
+
+
+
+```
+
+
+```{r}
+library(data.table)
+library(arrow)
+library(here)
+library(quanteda)
+library(quanteda.textstats)
+library(Matrix)
+library(future)
+library(future.apply)
+library(progressr)
+library(stringr)
+library(janitor)
+library(digest)
+
+plan(multisession, workers = 7)
+RcppParallel::setThreadOptions(numThreads = 7)
+Sys.setenv(RCPP_PARALLEL_NUM_THREADS = "7", OMP_NUM_THREADS = "7", MKL_NUM_THREADS = "7", OPENBLAS_NUM_THREADS = "7")
+data.table::setDTthreads(7)
+
+ts_tag <- "20251031_1019"
+desc_tbl <- readRDS(here("Data","Join_Keys","desc_tbl.rds"))
+stopifnot(exists("usa_base"))
+
+ts_tag <- format(Sys.time(), "%Y%m%d_%H%M%S")
+W2V_COMBINED_MATRIX_PATH <- here("runs","psc","outputs", paste0("w2v_combined_matrix_", ts_tag, ".rds"))
+COLLOC_PATH <- here("runs","psc","outputs", paste0("colloc_bigrams_", ts_tag, ".rds"))
+SIM_TOPK_EMB_DIR <- here("Data","validation", paste0("sim_topk_emb_stream_", ts_tag))
+SIM_TOPK_EMB_PATH <- here("Data","validation", paste0("sim_topk_emb_", ts_tag, ".parquet"))
+EMB_FEATURES_PATH <- here("Data","validation", paste0("emb_features_", ts_tag, ".parquet"))
+
+contracts_sample_rate <- 0.2
+domain_adapt_epochs <- 1L
+w2v_dim <- 300L
+w2v_window <- 8L
+w2v_min_count <- 10L
+w2v_neg <- 15L
+w2v_subsample <- 1e-5
+w2v_epochs <- 6L
+
+clean_vec <- function(x) {
+  x <- tolower(as.character(x))
+  x <- str_replace_all(x, "[^a-z0-9\\s\\-_/]", " ")
+  x <- str_squish(x)
+  x
+}
+
+prep_tokens <- function(txt, colloc = NULL) {
+  corp <- corpus(txt)
+  tks <- tokens(corp, remove_punct = FALSE)
+  if (!is.null(colloc) && nrow(colloc)) tks <- tokens_compound(tks, phrase(colloc$collocation))
+  tks
+}
+
+learn_collocations <- function(txt, min_count = 50L, size_cap = 5e6) {
+  n <- length(txt)
+  if (n > size_cap) {
+    set.seed(1L)
+    idx <- sample.int(n, size_cap)
+    txt <- txt[idx]
+  }
+  corp <- corpus(txt)
+  tks <- tokens(corp, remove_punct = TRUE)
+  coll <- textstat_collocations(tks, size = 2, min_count = min_count, tolower = TRUE)
+  out <- as.data.table(coll)[, .(collocation, lambda, count)]
+  out[order(-lambda)]
+}
+
+load_or_train_w2v <- function(path, toks, dim, window, min_count, neg, subsample, epochs) {
+  if (file.exists(path)) {
+    m <- readRDS(path)
+    if (is.matrix(m) && length(rownames(m))) return(m)
+  }
+  mdl <- wordvector::textmodel_word2vec(x = toks, dim = dim, type = "skip-gram", min_count = min_count, window = window, iter = epochs, alpha = 0.025, use_ns = TRUE, ns_size = neg, verbose = TRUE, subsample = subsample)
+  m <- as.matrix(mdl, normalized = FALSE)
+  saveRDS(m, path)
+  m
+}
+
+l2_norm_rows <- function(Z) {
+  nr <- sqrt(pmax(rowSums(Z^2), 1e-12))
+  Z / nr
+}
+
+doc_embed_chunk <- function(dfm_obj, W, idx_rows) {
+  M <- as(dfm_obj[idx_rows, , drop = FALSE], "dgCMatrix")
+  Z <- as.matrix(M %*% W)
+  l2_norm_rows(Z)
+}
+
+library(data.table)
+library(arrow)
+library(future)
+library(future.apply)
+library(progressr)
+library(Matrix)
+
+topk_cosine_stream2_parallel <- function(dfm_q, W, pair_keys, psc2_vec, k = 5L, chunk_rows = 20000L, tEp, out_dir, workers = 6L) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  n <- nrow(dfm_q)
+  if (is.null(n) || n == 0L) return(invisible(NULL))
+  idx <- split(seq_len(n), ceiling(seq_len(n) / chunk_rows))
+  oplan <- future::plan()
+  on.exit(future::plan(oplan), add = TRUE)
+  future::plan(multisession, workers = workers)
+  progressr::with_progress({
+    p <- progressr::progressor(along = seq_along(idx))
+    future.apply::future_lapply(
+      seq_along(idx),
+      function(i) {
+        data.table::setDTthreads(1L)
+        Sys.setenv(MKL_NUM_THREADS = "1", OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", RCPP_PARALLEL_NUM_THREADS = "1")
+        ii <- idx[[i]]
+        M_q <- as(dfm_q[ii, , drop = FALSE], "dgCMatrix")
+        Eq <- as.matrix(M_q %*% W)
+        nr <- sqrt(pmax(rowSums(Eq^2), 1e-12))
+        Eq <- Eq / nr
+        S <- Eq %*% tEp
+        res <- vector("list", nrow(S))
+        for (r in seq_len(nrow(S))) {
+          s <- S[r, ]
+          ord <- head(order(s, decreasing = TRUE), k)
+          res[[r]] <- data.table(pair_key_test = pair_keys[ii[r]], psc2 = psc2_vec[ord], emb = as.numeric(s[ord]), rank = seq_along(ord))
+        }
+        out <- data.table::rbindlist(res, use.names = TRUE)
+        fn <- file.path(out_dir, sprintf("part-%05d.parquet", i))
+        write_parquet(as_arrow_table(out), fn)
+        rm(M_q, Eq, nr, S, res, out); gc()
+        p()
+        invisible(NULL)
+      },
+      future.seed = TRUE,
+      future.chunk.size = 1
+    )
+  })
+  invisible(NULL)
+}
+
+
+clip_vec <- function(x, lo, hi) pmin(pmax(x, lo), hi)
+
+contracts_text <- clean_vec(usa_base$q)
+subcontracts_text <- clean_vec(desc_tbl$q)
+
+if (contracts_sample_rate < 1) {
+  set.seed(1L)
+  n_all <- length(contracts_text)
+  take <- sample.int(n_all, floor(contracts_sample_rate * n_all))
+  contracts_text_sample <- contracts_text[take]
+} else {
+  contracts_text_sample <- contracts_text
+}
+
+colloc <- learn_collocations(c(contracts_text_sample, subcontracts_text), min_count = 50L, size_cap = 5e6)
+saveRDS(colloc, COLLOC_PATH)
+
+toks_contracts <- prep_tokens(contracts_text_sample, colloc)
+toks_subcontracts <- prep_tokens(subcontracts_text, colloc)
+docnames(toks_contracts) <- paste0("c_", seq_len(ndoc(toks_contracts)))
+docnames(toks_subcontracts) <- paste0("s_", seq_len(ndoc(toks_subcontracts)))
+toks_all <- c(toks_contracts, toks_subcontracts)
+
+w2v_mat <- load_or_train_w2v(W2V_COMBINED_MATRIX_PATH, toks_all, w2v_dim, w2v_window, w2v_min_count, w2v_neg, w2v_subsample, w2v_epochs)
+
+if (domain_adapt_epochs > 0L) {
+  toks_da <- toks_subcontracts
+  docnames(toks_da) <- paste0("da_", seq_len(ndoc(toks_da)))
+  mdl_da <- wordvector::textmodel_word2vec(x = toks_da, dim = w2v_dim, type = "skip-gram", min_count = w2v_min_count, window = w2v_window, iter = domain_adapt_epochs, alpha = 0.025, use_ns = TRUE, ns_size = w2v_neg, verbose = TRUE, subsample = w2v_subsample, input = w2v_mat)
+  w2v_mat <- as.matrix(mdl_da, normalized = FALSE)
+  saveRDS(w2v_mat, W2V_COMBINED_MATRIX_PATH)
+}
+
+psc2_vec <- unique(usa_base$psc2_true)
+psc2_vec <- sort(psc2_vec[nchar(psc2_vec) == 2])
+psc2_vec <- unique(psc2_vec)
+
+psc2_titles <- psc2_vec
+t_text <- tolower(psc2_titles)
+t_text <- str_replace_all(t_text, "[^[:alnum:]\\s\\-_/]", " ")
+t_text <- str_squish(t_text)
+corp_p <- corpus(t_text)
+toks_p <- tokens(corp_p, remove_punct = FALSE)
+toks_p <- tokens_compound(toks_p, phrase(colloc$collocation))
+dfm_p <- dfm(toks_p)
+
+q_text <- contracts_text
+corp_q <- corpus(q_text)
+toks_q <- tokens(corp_q, remove_punct = FALSE)
+toks_q <- tokens_compound(toks_q, phrase(colloc$collocation))
+dfm_q <- dfm(toks_q)
+
+feat_keep <- intersect(colnames(dfm_q), rownames(w2v_mat))
+stopifnot(length(feat_keep) > 0)
+
+dfm_q <- quanteda::dfm_match(dfm_q, feat_keep)
+dfm_p <- quanteda::dfm_match(dfm_p, feat_keep)
+W <- w2v_mat[feat_keep, , drop = FALSE]
+
+M_p <- as(dfm_p, "dgCMatrix")
+Ep <- as.matrix(M_p %*% W)
+Ep <- l2_norm_rows(Ep)
+tEp <- t(Ep)
+
+q_vec <- as.character(usa_base$q)
+pair_keys <- usa_base$pair_key_test
+pair_keys <- pair_keys[seq_along(q_vec)]
+
+topk_cosine_stream2_parallel(
+  dfm_q = dfm_q,
+  W = W,
+  pair_keys = usa_base$pair_key_test,
+  psc2_vec = psc2_vec,
+  k = 5L,
+  chunk_rows = 15000L,
+  tEp = tEp,
+  out_dir = SIM_TOPK_EMB_DIR,
+  workers = 6L
+)
+
+ds_raw <- arrow::open_dataset(SIM_TOPK_EMB_DIR, format = "parquet")
+sim_topk_emb <- as.data.table(collect(ds_raw))
+
+setDT(sim_topk_emb)
+sim_topk_emb <- sim_topk_emb[!is.na(psc2) & is.finite(emb)]
+
+sim_topk_emb <- sim_topk_emb[, .SD[which.max(emb)], by = .(pair_key_test, psc2)]
+setorder(sim_topk_emb, pair_key_test, -emb)
+sim_topk_emb[, rank := seq_len(.N), by = pair_key_test]
+
+setkey(sim_topk_emb, pair_key_test, psc2)
+
+emb_vals <- sim_topk_emb$emb
+emb_vals <- emb_vals[is.finite(emb_vals)]
+q_lo_e <- as.numeric(quantile(emb_vals, 0.01, na.rm = TRUE))
+q_hi_e <- as.numeric(quantile(emb_vals, 0.999, na.rm = TRUE))
+emb_clip <- clip_vec(sim_topk_emb$emb, q_lo_e, q_hi_e)
+log_lo_e <- log1p(q_lo_e)
+log_hi_e <- log1p(q_hi_e)
+log_rng_e <- (log_hi_e - log_lo_e); if (log_rng_e <= 0) log_rng_e <- max(1, abs(log_hi_e))
+sim_topk_emb[, emb_log := (log1p(emb_clip) - log_lo_e) / log_rng_e]
+
+dir.create(dirname(SIM_TOPK_EMB_PATH), recursive = TRUE, showWarnings = FALSE)
+write_dataset(as_arrow_table(sim_topk_emb[, .(pair_key_test, psc2, emb, rank)]), SIM_TOPK_EMB_PATH, format = "parquet", existing_data_behavior = "overwrite_or_ignore")
+write_dataset(as_arrow_table(sim_topk_emb[, .(pair_key_test, psc2, emb, emb_log)]), EMB_FEATURES_PATH, format = "parquet", existing_data_behavior = "overwrite_or_ignore")
+
+
+
+
+```
+
+
+```{r}
+desc_tbl <- readRDS(here("Data", "Join_Keys", " desc_tbl.rds"))
+
+plan(multisession, workers = 7)
+
+W2V_COMBINED_MATRIX_PATH <- here("runs","psc","outputs","w2v_combined_matrix.rds")
+COLLOC_PATH <- here("runs","psc","outputs","colloc_bigrams.rds")
+SIM_TOPK_EMB_PATH <- here("Data","validation","sim_topk_emb.parquet")
+EMB_FEATURES_PATH <- here("Data","validation","emb_features.parquet")
+
+contracts_sample_rate <- 0.4
+domain_adapt_epochs <- 1L
+w2v_dim <- 300L
+w2v_window <- 8L
+w2v_min_count <- 10L
+w2v_neg <- 15L
+w2v_subsample <- 1e-5
+w2v_epochs <- 6L
+
+mask_serials <- F
+serial_regex <- "(?i)(?:[A-Z0-9]{6,})"
+
+clean_vec <- function(x) {
+  x <- tolower(as.character(x))
+  x <- str_replace_all(x, "[^a-z0-9\\s\\-_/]", " ")
+  x <- str_squish(x)
+  x
+}
+
+apply_serial_mask <- function(x, enable = FALSE) {
+  if (!enable) return(x)
+  str_replace_all(x, serial_regex, "SERIALCODE")
+}
+
+prep_tokens <- function(txt, colloc = NULL) {
+  corp <- corpus(txt)
+  tks <- tokens(corp, remove_punct = FALSE)
+  if (!is.null(colloc) && nrow(colloc)) {
+    tks <- tokens_compound(tks, phrase(colloc$collocation))
+  }
+  tks
+}
+
+learn_collocations <- function(txt, min_count = 50L, size_cap = 5e6) {
+  n <- length(txt)
+  if (n > size_cap) {
+    set.seed(1L)
+    idx <- sample.int(n, size_cap)
+    txt <- txt[idx]
+  }
+  corp <- corpus(txt)
+  tks <- tokens(corp, remove_punct = TRUE)
+  coll <- textstat_collocations(tks, size = 2, min_count = min_count, tolower = TRUE)
+  coll[order(-coll$lambda), c("collocation","lambda")]
+}
+
+load_or_train_w2v <- function(path, toks, dim, window, min_count, neg, subsample, epochs) {
+  if (file.exists(path)) {
+    m <- readRDS(path)
+    if (is.matrix(m) && length(rownames(m))) return(m)
+  }
+  mdl <- wordvector::textmodel_word2vec(x = toks, dim = dim, type = "skip-gram", min_count = min_count, window = window, iter = epochs, alpha = 0.025, use_ns = TRUE, ns_size = neg, verbose = TRUE, subsample = subsample)
+  m <- as.matrix(mdl, normalized = FALSE)
+  saveRDS(m, path)
+  m
+}
+
+l2_norm_rows <- function(Z) {
+  nr <- sqrt(pmax(rowSums(Z^2), 1e-12))
+  Z / nr
+}
+
+doc_embed_chunk <- function(dfm_obj, W, idx_rows) {
+  M <- as(dfm_obj[idx_rows, , drop = FALSE], "dgCMatrix")
+  Z <- as.matrix(M %*% W)
+  l2_norm_rows(Z)
+}
+
+topk_cosine_stream2 <- function(dfm_q, W, pair_keys, psc2_vec, k = 5L, chunk_rows = 25000L, workers = 7L, tEp) {
+  n <- nrow(dfm_q)
+  if (is.null(n) || n == 0L) return(data.table(pair_key_test=character(), psc2=character(), emb=numeric(), rank=integer()))
+  idx <- split(seq_len(n), ceiling(seq_len(n) / chunk_rows))
+  progressr::with_progress({
+    p <- progressr::progressor(along = seq_along(idx))
+    eq_list <- lapply(idx, function(ii) doc_embed_chunk(dfm_q, W, ii))
+    pk_list <- lapply(idx, function(ii) pair_keys[ii])
+    o <- future.apply::future_lapply(seq_along(eq_list), function(i){
+      data.table::setDTthreads(1L)
+      Sys.setenv(MKL_NUM_THREADS = "1", OMP_NUM_THREADS = "1")
+      Eq_i <- eq_list[[i]]
+      pk_i <- pk_list[[i]]
+      S <- Eq_i %*% tEp
+      res <- vector("list", nrow(S))
+      for (r in seq_len(nrow(S))) {
+        s <- S[r,]
+        ord <- head(order(s, decreasing = TRUE), k)
+        res[[r]] <- data.table(pair_key_test = pk_i[r], psc2 = psc2_vec[ord], emb = as.numeric(s[ord]), rank = seq_along(ord))
+      }
+      p()
+      data.table::rbindlist(res, use.names = TRUE)
+    }, future.seed = TRUE, future.globals = c("tEp","psc2_vec","K_text"))
+    data.table::rbindlist(o, use.names = TRUE)
+  })
+}
+
+
+stopifnot(exists("usa_base"), exists("desc_tbl"))
+
+contracts_text <- clean_vec(usa_base$q)
+subcontracts_text <- clean_vec(desc_tbl$q)
+
+if (mask_serials) {
+  contracts_text <- apply_serial_mask(contracts_text, TRUE)
+  subcontracts_text <- apply_serial_mask(subcontracts_text, TRUE)
+}
+
+if (contracts_sample_rate < 1) {
+  set.seed(1L)
+  n_all <- length(contracts_text)
+  take <- sample.int(n_all, floor(contracts_sample_rate * n_all))
+  contracts_text_sample <- contracts_text[take]
+} else {
+  contracts_text_sample <- contracts_text
+}
+
+colloc <- if (file.exists(COLLOC_PATH)) {
+  readRDS(COLLOC_PATH)
+} else {
+  cands <- learn_collocations(c(contracts_text_sample, subcontracts_text), min_count = 50L, size_cap = 5e6)
+  saveRDS(cands, COLLOC_PATH)
+  cands
+}
+
+toks_contracts <- prep_tokens(contracts_text_sample, colloc)
+toks_subcontracts <- prep_tokens(subcontracts_text, colloc)
+toks_all <- c(toks_contracts, toks_subcontracts)
+docnames(toks_all) <- paste0("d_", seq_len(ndoc(toks_all)))
+
+w2v_mat <- load_or_train_w2v(W2V_COMBINED_MATRIX_PATH, toks_all, w2v_dim, w2v_window, w2v_min_count, w2v_neg, w2v_subsample, w2v_epochs)
+
+if (domain_adapt_epochs > 0L) {
+  toks_da <- toks_subcontracts
+  docnames(toks_da) <- paste0("da_", seq_len(ndoc(toks_da)))
+  mdl_da <- wordvector::textmodel_word2vec(x = toks_da, dim = w2v_dim, type = "skip-gram", min_count = w2v_min_count, window = w2v_window, iter = domain_adapt_epochs, alpha = 0.025, use_ns = TRUE, ns_size = w2v_neg, verbose = TRUE, subsample = w2v_subsample, input = w2v_mat)
+  w2v_mat <- as.matrix(mdl_da, normalized = FALSE)
+  saveRDS(w2v_mat, W2V_COMBINED_MATRIX_PATH)
+}
+
+feat_keep <- intersect(colnames(dfm_q), rownames(w2v_mat))
+if (!length(feat_keep)) {
+  stop("No overlapping vocabulary between dfm_q and word2vec matrix.")
+}
+
+
+dfm_q <- quanteda::dfm_match(dfm_q, feat_keep)
+dfm_p <- quanteda::dfm_match(dfm_p, feat_keep)
+W <- w2v_mat[feat_keep, , drop = FALSE]
+
+M_p <- as(dfm_p, "dgCMatrix")
+Ep <- as.matrix(M_p %*% W)
+Ep <- l2_norm_rows(Ep)
+tEp <- t(Ep)
+
+sim_topk_emb <- topk_cosine_stream2(dfm_q, W, usa_base$pair_key_test, psc2_vec, k = K_text, chunk_rows = chunk_rows, workers = 7L, tEp = tEp)
+setDT(sim_topk_emb)
+sim_topk_emb <- sim_topk_emb[!is.na(psc2) & is.finite(emb)]
+sim_topk_emb <- sim_topk_emb[, .(emb = max(emb, na.rm = TRUE), rank = min(rank, na.rm = TRUE)), by = .(pair_key_test, psc2)]
+setkey(sim_topk_emb, pair_key_test, psc2)
+
+emb_vals <- sim_topk_emb$emb
+emb_vals <- emb_vals[is.finite(emb_vals)]
+q_lo_e <- as.numeric(quantile(emb_vals, 0.01, na.rm = TRUE))
+q_hi_e <- as.numeric(quantile(emb_vals, 0.999, na.rm = TRUE))
+clip_vec <- function(x, lo, hi) pmin(pmax(x, lo), hi)
+emb_clip <- clip_vec(sim_topk_emb$emb, q_lo_e, q_hi_e)
+log_lo_e <- log1p(q_lo_e)
+log_hi_e <- log1p(q_hi_e)
+log_rng_e <- (log_hi_e - log_lo_e)
+if (log_rng_e <= 0) log_rng_e <- max(1, abs(log_hi_e))
+sim_topk_emb[, emb_log := (log1p(emb_clip) - log_lo_e) / log_rng_e]
+
+dir.create(dirname(SIM_TOPK_EMB_PATH), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(EMB_FEATURES_PATH), recursive = TRUE, showWarnings = FALSE)
+
+write_dataset(as_arrow_table(sim_topk_emb[, .(pair_key_test, psc2, emb, rank)]), SIM_TOPK_EMB_PATH, format = "parquet", existing_data_behavior = "overwrite_or_ignore")
+write_dataset(as_arrow_table(sim_topk_emb[, .(pair_key_test, psc2, emb, emb_log)]), EMB_FEATURES_PATH, format = "parquet", existing_data_behavior = "overwrite_or_ignore")
+
+
+
+
+library(data.table)
+library(arrow)
+library(quanteda)
+library(progressr)
+
+stream_topk_cosine_to_parquet <- function(q_vec, pair_keys, colloc, feat_keep, W, tEp, psc2_vec, out_dir, k = 5L, docs_per_chunk = 25000L) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  stopifnot(length(q_vec) == length(pair_keys))
+  n <- length(q_vec)
+  idx <- split(seq_len(n), ceiling(seq_len(n) / docs_per_chunk))
+  progressr::with_progress({
+    p <- progressr::progressor(along = seq_along(idx))
+    part_no <- 0L
+    for (i in seq_along(idx)) {
+      ii <- idx[[i]]
+      toks_q_i <- tokens(corpus(q_vec[ii]), remove_punct = FALSE)
+      if (!is.null(colloc) && nrow(colloc)) toks_q_i <- tokens_compound(toks_q_i, phrase(colloc$collocation))
+      dfm_q_i <- dfm(toks_q_i)
+      dfm_q_i <- quanteda::dfm_match(dfm_q_i, feat_keep)
+      M_q <- as(dfm_q_i, "dgCMatrix")
+      Eq <- as.matrix(M_q %*% W)
+      nr <- sqrt(pmax(rowSums(Eq^2), 1e-12))
+      Eq <- Eq / nr
+      S <- Eq %*% tEp
+      res <- vector("list", nrow(S))
+      for (r in seq_len(nrow(S))) {
+        s <- S[r,]
+        ord <- head(order(s, decreasing = TRUE), k)
+        res[[r]] <- data.table(pair_key_test = pair_keys[ii[r]], psc2 = psc2_vec[ord], emb = as.numeric(s[ord]), rank = seq_along(ord))
+      }
+      out <- rbindlist(res, use.names = TRUE)
+      part_no <- part_no + 1L
+      fn <- file.path(out_dir, sprintf("part-%05d.parquet", part_no))
+      write_parquet(as_arrow_table(out), fn)
+      rm(toks_q_i, dfm_q_i, M_q, Eq, nr, S, res, out); gc()
+      p()
+    }
+  })
+}
+
+clip_vec <- function(x, lo, hi) pmin(pmax(x, lo), hi)
+
+q_vec <- as.character(usa_base$q)
+pair_keys <- usa_base$pair_key_test
+
+out_dir_raw <- here("Data","validation","sim_topk_emb_stream")
+stream_topk_cosine_to_parquet(q_vec, pair_keys, colloc, feat_keep, W, tEp, psc2_vec, out_dir_raw, k = K_text, docs_per_chunk = 20000L)
+
+ds_raw <- arrow::open_dataset(out_dir_raw, format = "parquet")
+sim_topk_emb <- as.data.table(collect(ds_raw))
+
+setDT(sim_topk_emb)
+sim_topk_emb <- sim_topk_emb[!is.na(psc2) & is.finite(emb)]
+sim_topk_emb <- sim_topk_emb[, .(emb = max(emb, na.rm = TRUE), rank = min(rank, na.rm = TRUE)), by = .(pair_key_test, psc2)]
+setkey(sim_topk_emb, pair_key_test, psc2)
+
+emb_vals <- sim_topk_emb$emb
+emb_vals <- emb_vals[is.finite(emb_vals)]
+q_lo_e <- as.numeric(quantile(emb_vals, 0.01, na.rm = TRUE))
+q_hi_e <- as.numeric(quantile(emb_vals, 0.999, na.rm = TRUE))
+emb_clip <- clip_vec(sim_topk_emb$emb, q_lo_e, q_hi_e)
+log_lo_e <- log1p(q_lo_e)
+log_hi_e <- log1p(q_hi_e)
+log_rng_e <- (log_hi_e - log_lo_e); if (log_rng_e <= 0) log_rng_e <- max(1, abs(log_hi_e))
+sim_topk_emb[, emb_log := (log1p(emb_clip) - log_lo_e) / log_rng_e]
+
+write_dataset(as_arrow_table(sim_topk_emb[, .(pair_key_test, psc2, emb, rank)]), here("Data","validation","sim_topk_emb.parquet"), format = "parquet", existing_data_behavior = "overwrite")
+write_dataset(as_arrow_table(sim_topk_emb[, .(pair_key_test, psc2, emb, emb_log)]), here("Data","validation","emb_features.parquet"), format = "parquet", existing_data_behavior = "overwrite_or_ignore")
+
+
+
+```
+
+below old
+
+```{r}
+W2V_MATRIX_PATH <- here("runs","psc","outputs","w2v_bigrams_matrix.rds")
+docnames(toks_q) <- paste0("q_", seq_len(quanteda::ndoc(toks_q)))
+docnames(toks_p) <- paste0("p_", seq_len(quanteda::ndoc(toks_p)))
+toks_all <- c(toks_q, toks_p)
+load_or_train_w2v <- function(path, toks, dim, window, min_count, neg, subsample, epochs) {
+  if (file.exists(path)) {
+    m <- readRDS(path)
+    if (is.matrix(m) && length(rownames(m))) return(m)
+  }
+  mdl <- wordvector::textmodel_word2vec(x = toks, dim = dim, type = "skip-gram", min_count = min_count, window = window, iter = epochs, alpha = 0.025, use_ns = TRUE, ns_size = neg, verbose = TRUE)
+  m <- as.matrix(mdl, normalized = FALSE)
+  saveRDS(m, path)
+  m
+}
+w2v_mat <- load_or_train_w2v(W2V_MATRIX_PATH, toks_all, w2v_dim, w2v_window, w2v_min_count, w2v_neg, w2v_subsample, w2v_epochs)
+feat_keep <- intersect(colnames(dfm_q), rownames(w2v_mat))
+if (length(feat_keep) == 0L) {
+  w2v_mat <- load_or_train_w2v(tempfile(fileext = ".rds"), toks_all, w2v_dim, w2v_window, max(1L, floor(w2v_min_count/2)), w2v_neg, w2v_subsample, w2v_epochs)
+  feat_keep <- intersect(colnames(dfm_q), rownames(w2v_mat))
+}
+dfm_q <- quanteda::dfm_match(dfm_q, feat_keep)
+dfm_p <- quanteda::dfm_match(dfm_p, feat_keep)
+W <- w2v_mat[feat_keep, , drop = FALSE]
+l2_norm_rows <- function(Z) {nr <- sqrt(pmax(rowSums(Z^2), 1e-12)); Z / nr}
+build_Ep_once <- function(dfm_p, W) {M <- as(dfm_p, "dgCMatrix"); Z <- as.matrix(M %*% W); l2_norm_rows(Z)}
+doc_embed_chunk <- function(dfm_obj, W, idx_rows) {M <- as(dfm_obj[idx_rows, , drop = FALSE], "dgCMatrix"); Z <- as.matrix(M %*% W); l2_norm_rows(Z)}
+Ep <- build_Ep_once(dfm_p, W)
+tEp <- t(Ep)
+topk_cosine_stream2 <- function(dfm_q, W, pair_keys, psc2_vec, k = 5L, chunk_rows = 25000L){
+  n <- nrow(dfm_q)
+  if (is.null(n) || n == 0L) return(data.table(pair_key_test=character(), psc2=character(), emb=numeric(), rank=integer()))
+  idx <- split(seq_len(n), ceiling(seq_len(n) / chunk_rows))
+  eq_list <- lapply(idx, function(ii) doc_embed_chunk(dfm_q, W, ii))
+  pk_list <- lapply(idx, function(ii) pair_keys[ii])
+  out <- future.apply::future_lapply(seq_along(eq_list), function(i){
+    Eq_i <- eq_list[[i]]
+    pk_i <- pk_list[[i]]
+    S <- Eq_i %*% tEp
+    res <- vector("list", nrow(S))
+    for (r in seq_len(nrow(S))) {
+      s <- S[r,]
+      ord <- head(order(s, decreasing = TRUE), k)
+      res[[r]] <- data.table(pair_key_test = pk_i[r], psc2 = psc2_vec[ord], emb = as.numeric(s[ord]), rank = seq_along(ord))
+    }
+    data.table::rbindlist(res, use.names = TRUE)
+  }, future.seed = TRUE, future.globals = c("tEp","psc2_vec","K_text"))
+  data.table::rbindlist(out, use.names = TRUE)
+}
+sim_topk_emb <- topk_cosine_stream2(dfm_q, W, usa_base$pair_key_test, psc2_vec, k = K_text, chunk_rows = chunk_rows)
+setDT(sim_topk_emb)
+sim_topk_emb <- sim_topk_emb[, .(emb = max(emb, na.rm = TRUE), rank = min(rank, na.rm = TRUE)), by = .(pair_key_test, psc2)]
+setkey(sim_topk_emb, pair_key_test, psc2)
+emb_vals <- sim_topk_emb$emb
+emb_vals <- emb_vals[is.finite(emb_vals)]
+q_lo_e  <- as.numeric(quantile(emb_vals, 0.01,  na.rm = TRUE))
+q_hi_e  <- as.numeric(quantile(emb_vals, 0.999, na.rm = TRUE))
+emb_clip <- clip_vec(sim_topk_emb$emb, q_lo_e, q_hi_e)
+log_lo_e <- log1p(q_lo_e)
+log_hi_e <- log1p(q_hi_e)
+log_rng_e <- (log_hi_e - log_lo_e); if (log_rng_e <= 0) log_rng_e <- max(1, abs(log_hi_e))
+sim_topk_emb[, emb_log := (log1p(emb_clip) - log_lo_e) / log_rng_e]
+```
+
+^ old
+```{r}
+priors6 <- read_parquet(here("Data","Prior","Priors","prior_naics6_psc.parquet"))
+setDT(priors6)
+priors6[, naics6 := substr(gsub("[^0-9]", "", as.character(naics)), 1, 6)]
+priors6[, psc4   := toupper(str_trim(as.character(psc)))]
+priors6[, p      := as.numeric(p)]
+priors6 <- priors6[nchar(naics6) == 6 & nchar(psc4) == 4 & is.finite(p) & p > 0]
+priors6[, psc2   := substr(psc4, 1, 2)]
+naics_psc2_prior <- priors6[, .(p = sum(p, na.rm = TRUE)), by = .(naics6, psc2)]
+naics_psc2_prior[, p := p / (sum(p) + 1e-9), by = naics6]
+setkey(naics_psc2_prior, naics6)
+naics_map_test <- unique(usa_base[!is.na(naics6), .(pair_key_test, naics6)])
+setkey(naics_map_test, naics6)
+naics_map_test <- naics_map_test[naics6 %chin% naics_psc2_prior$naics6]
+pk_t <- unique(naics_map_test$pair_key_test)
+batch_size <- 200000L
+batches <- split(pk_t, ceiling(seq_along(pk_t) / batch_size))
+p_naics_test <- rbindlist(lapply(batches, function(bk) {
+  nm <- naics_map_test[pair_key_test %in% bk]
+  naics_psc2_prior[
+    nm,
+    on = "naics6",
+    allow.cartesian = TRUE,
+    nomatch = 0L,
+    .(pair_key_test = i.pair_key_test, psc2, p_naics = x.p)
+  ][, p_naics := p_naics / (sum(p_naics) + 1e-9), by = pair_key_test]
+}), use.names = TRUE)
+setkey(p_naics_test, pair_key_test, psc2)
+p_naics_test[is.na(p_naics), p_naics := 0]
+
+uei_cols <- usa_base[!is.na(UEI) & nzchar(UEI) & nchar(psc2_true) == 2 & !is.na(action_date)]
+uei_cols[, date := as.IDate(as.character(action_date))]
+uei_cols <- uei_cols[!is.na(date)]
+# uei_cols[, psc2 := substr(psc4_true, 1, 2)]
+uei_cols[, psc2 := psc2_true]
+today_ <- Sys.Date()
+decay_lambda <- log(2) / half_life_days
+uei_cols[, w := exp(-decay_lambda * as.numeric(as.IDate(today_) - date))]
+uei_psc_counts <- uei_cols[, .(w_n = sum(w)), by = .(UEI, psc2)]
+global_psc2 <- uei_psc_counts[, .(g_n = sum(w_n)), by = psc2][, g_p := g_n / sum(g_n)]
+setkey(global_psc2, psc2)
+setkey(uei_psc_counts, psc2)
+uei_psc_counts <- global_psc2[uei_psc_counts]
+uei_psc_counts[is.na(g_p), g_p := 1 / uniqueN(psc2)]
+uei_psc_counts[, uei_tot := sum(w_n), by = UEI]
+uei_psc_counts[, den := uei_tot + alpha0]
+uei_psc_counts[, p_shrunk := (w_n + alpha0 * g_p) / den]
+uei_psc2_map <- uei_psc_counts[, .(p_uei = sum(p_shrunk)), by = .(UEI, psc2)]
+uei_psc2_map[, p_uei := p_uei / (sum(p_uei) + 1e-9), by = UEI]
+setkey(uei_psc2_map, UEI, psc2)
+uei_link_test <- usa_base[!is.na(UEI) & nzchar(UEI), .(pair_key_test, UEI)]
+setkey(uei_link_test, UEI)
+uei_link_test <- uei_link_test[UEI %chin% uei_psc2_map$UEI]
+u <- unique(uei_link_test$UEI)
+batches_u <- split(u, ceiling(seq_along(u) / batch_size))
+p_uei_test <- rbindlist(lapply(batches_u, function(bu){
+  lk <- uei_link_test[.(bu), nomatch = 0L]
+  uei_psc2_map[
+    lk,
+    on = "UEI",
+    allow.cartesian = TRUE,
+    nomatch = 0L,
+    .(pair_key_test = i.pair_key_test, psc2, p_uei = x.p_uei)
+  ][, p_uei := p_uei / (sum(p_uei) + 1e-9), by = pair_key_test]
+}), use.names = TRUE)
+setkey(p_uei_test, pair_key_test, psc2)
+p_uei_test[is.na(p_uei), p_uei := 0]
+
+N_add <- 3L
+TH_NAICS <- 0.10
+TH_UEI   <- 0.00
+pri_top_naics <- {
+  x <- p_naics_test[p_naics >= TH_NAICS, .(pair_key_test, psc2, p_naics)]
+  x[, r := data.table::frank(-p_naics, ties.method = "first"), by = pair_key_test]
+  x[r <= N_add, .(pair_key_test, psc2)]
+}
+pri_top_uei <- {
+  x <- p_uei_test[p_uei >= TH_UEI, .(pair_key_test, psc2, p_uei)]
+  x[, r := data.table::frank(-p_uei, ties.method = "first"), by = pair_key_test]
+  x[r <= N_add, .(pair_key_test, psc2)]
+}
+cand_bm25 <- unique(sim_topk_bm25[, .(pair_key_test, psc2)])
+cand_emb  <- unique(sim_topk_emb [, .(pair_key_test, psc2)])
+candidates <- unique(rbindlist(list(cand_bm25, cand_emb, pri_top_naics, pri_top_uei), use.names = TRUE, fill = TRUE))
+setkey(candidates, pair_key_test, psc2)
+
+
+bm25_cols <- sim_topk_bm25[, .(bm25_log = max(bm25_log, na.rm = TRUE)), 
+                           by = .(pair_key_test, psc2)]
+emb_cols  <- sim_topk_emb [, .(emb_log  = max(emb_log,  na.rm = TRUE)), 
+                           by = .(pair_key_test, psc2)]
+naic_cols <- p_naics_test[, .(p_naics  = max(p_naics,  na.rm = TRUE)), 
+                           by = .(pair_key_test, psc2)]
+uei_cols  <- p_uei_test  [, .(p_uei    = max(p_uei,    na.rm = TRUE)), 
+                           by = .(pair_key_test, psc2)]
+
+
+feat <- Reduce(function(x, y) merge(x, y, by = c("pair_key_test","psc2"), all.x = TRUE),
+               list(candidates, bm25_cols, emb_cols, naic_cols, uei_cols))
+
+
+na_cols <- c("bm25_log", "emb_log", "p_naics", "p_uei")
+for (col in na_cols) set(feat, which(is.na(feat[[col]])), col, 0L)
+
+
+qid_map_test <- unique(usa_base[, .(pair_key_test, query_id_test)])
+feat <- qid_map_test[feat, on = "pair_key_test"]
+
+BM25_TH    <- 0.20
+BM25_FLOOR <- 0.15
+feat[, bm25_eff := fifelse(bm25_log >= BM25_TH, bm25_log, bm25_log * BM25_FLOOR)]
+
+w_uei    <- 0.30
+w_bm25   <- 0.18
+w_naic   <- 0.17
+w_emb    <- 0.06
+w_qprior <- 0.12
+
+feat[, score := w_uei*p_uei + w_bm25*bm25_eff + w_naic*p_naics + w_emb*emb_log]
+
+setorder(feat, pair_key_test, -score)
+top10_pk <- feat[, .SD[1L:min(.N, 10L)], by = pair_key_test]
+qcnt <- unique(top10_pk[, .(pair_key_test, query_id_test)])[, .(n_pairs = uniqueN(pair_key_test)), by = query_id_test]
+multi_ids <- qcnt[n_pairs > 1L, query_id_test]
+qp_raw <- top10_pk[query_id_test %chin% multi_ids, .(sum_score = sum(score, na.rm = TRUE)), by = .(query_id_test, psc2)]
+qp <- qp_raw[, .(psc2, query_id_test, query_prior = sum_score / (sum(sum_score) + 1e-9)), by = query_id_test]
+setkey(qp, query_id_test, psc2)
+feat <- qp[feat, on = .(query_id_test, psc2)]
+feat[is.na(query_prior) | !(query_id_test %in% multi_ids), query_prior := 0]
+feat[, score_final := score + w_qprior * query_prior]
+
+setorder(feat, pair_key_test, -score_final)
+feat[, rank := seq_len(.N), by = pair_key_test]
+
+
+
+# form final score
+```
+with glmnet weights 
+```{r}
+
+
+library(data.table)
+library(pROC)
+
+stopifnot(exists("feat"), exists("usa_base"))
+if (!is.data.table(feat)) setDT(feat)
+if (!is.data.table(usa_base)) setDT(usa_base)
+
+truth <- unique(usa_base[, .(pair_key_test, psc2_true, q)])
+feat  <- truth[feat, on = "pair_key_test"]
+
+feat[, correct := as.integer(psc2 == psc2_true)]
+feat <- feat[is.finite(bm25_log) & is.finite(emb_log) & is.finite(p_naics) & is.finite(p_uei) & is.finite(query_prior)]
+feat <- feat[!is.na(correct)]
+
+set.seed(42L)
+keys <- unique(feat$pair_key_test)
+tr_keys <- sample(keys, size = floor(0.8 * length(keys)))
+te_keys <- setdiff(keys, tr_keys)
+
+train <- feat[pair_key_test %chin% tr_keys]
+test  <- feat[pair_key_test %chin% te_keys]
+
+fit <- glm(correct ~ p_uei + bm25_log + p_naics + emb_log + query_prior + 
+             bm25_log*emb_log + bm25_log*query_prior,
+           data = train, family = binomial())
+
+
+coefs <- coef(fit)[-1]
+w_raw <- pmax(coefs, 0)
+w_logit <- w_raw / sum(w_raw)
+
+test$prob_glm <- predict(fit, newdata = test, type = "response")
+test[, score_glm_w := w_logit[1]*p_uei + w_logit[2]*bm25_log + w_logit[3]*p_naics + w_logit[4]*emb_log + w_logit[5]*query_prior]
+
+setorder(test, pair_key_test, -prob_glm)
+test[, rank_glm := seq_len(.N), by = pair_key_test]
+setorder(test, pair_key_test, -score_glm_w)
+test[, rank_w := seq_len(.N), by = pair_key_test]
+
+by_key_glm <- test[, .(
+  correct_top1_glm = as.integer(any(rank_glm == 1L & correct == 1L)),
+  correct_top5_glm = as.integer(any(rank_glm <= 5L & correct == 1L))
+), by = pair_key_test]
+
+
+by_key_w <- test[, .(
+  correct_top1_w = as.integer(any(rank_w == 1L & correct == 1L)),
+  correct_top5_w = as.integer(any(rank_w <= 5L & correct == 1L))
+), by = pair_key_test]
+
+acc_top1_glm   <- mean(by_key_glm$correct_top1_glm, na.rm = TRUE)
+recall_at5_glm <- mean(by_key_glm$correct_top5_glm,  na.rm = TRUE)
+acc_top1_w     <- mean(by_key_w$correct_top1_w,      na.rm = TRUE)
+recall_at5_w   <- mean(by_key_w$correct_top5_w,      na.rm = TRUE)
+
+roc_glm <- pROC::roc(test$correct, test$prob_glm, quiet = TRUE)
+auc_glm <- as.numeric(roc_glm$auc)
+
+metrics <- data.table(
+  auc_glm = auc_glm,
+  acc_top1_glm = acc_top1_glm,
+  recall_at5_glm = recall_at5_glm,
+  acc_top1_w = acc_top1_w,
+  recall_at5_w = recall_at5_w
+)
+
+top_cols <- c("pair_key_test","q","psc2_true","psc2","prob_glm","rank_glm","score_glm_w","rank_w")
+top1_out <- unique(test[rank_glm == 1L, ..top_cols])
+top5_hit <- test[, .(top5_correct_glm = as.integer(any(rank_glm <= 5L & correct == 1L)),
+                     top5_correct_w   = as.integer(any(rank_w   <= 5L & correct == 1L))),
+                 by = pair_key_test]
+
+list(
+  weights = w_logit,
+  metrics = metrics,
+  top1_rows = top1_out,
+  top5_by_pair = top5_hit,
+  fit_summary = summary(fit)
+)
+
+
+feat[, score_final := predict(fit, newdata = feat, type = "response")]
+
+
+
+```
+
+```{r}
+feat[, margin := score_final[1L] - score_final[pmin(2L, .N)], by = pair_key_test]
+
+family_scores_test <- feat[rank <= 5L, .(pair_key_test, query_id_test, psc2, bm25_log, emb_log, p_naics, p_uei, query_prior, score, score_final, rank, margin)]
+family_pick_test   <- family_scores_test[, .SD[1L:min(.N, 5L)], by = pair_key_test]
+setorder(family_pick_test, pair_key_test, rank)
+
+truth <- unique(usa_base[, .(pair_key_test, psc2_true, q)])
+family_pick_test <- truth[family_pick_test, on = "pair_key_test"]
+family_scores_test <- truth[family_scores_test, on = "pair_key_test"]
+
+family_pick_test[, correct_top1 := as.integer(rank == 1L & psc2 == psc2_true)]
+family_scores_test[, correct_any := as.integer(psc2 == psc2_true)]
+acc_top1 <- mean(family_pick_test[rank == 1L]$correct_top1, na.rm = TRUE)
+recall_at5 <- family_scores_test[, .(hit = max(correct_any, na.rm = TRUE)), by = pair_key_test][, mean(hit, na.rm = TRUE)]
+
+metrics <- data.table(metric = c("accuracy_top1","recall_at5"), value = c(acc_top1, recall_at5))
+
+saveRDS(metrics, here("Data", "validation","metrics_usa_test.rds"))
+
+write_dataset(as_arrow_table(family_scores_test), here("Data", "validation","family_scores_test.parquet"), format = "parquet", existing_data_behavior = "overwrite")
+saveRDS(family_scores_test, here("Data", "validation","family_scores_test.rds"))
+write_dataset(as_arrow_table(family_pick_test), here("Data", "validation","family_pick_test.parquet"), format = "parquet", existing_data_behavior = "overwrite_or_ignore")
+saveRDS(family_pick_test, here("Data", "validation","family_pick_test.rds"))
+write_dataset(as_arrow_table(feat), here("Data", "validation","feat_test.parquet"), format = "parquet", existing_data_behavior = "overwrite_or_ignore")
+saveRDS(feat, here("Data", "validation","feat_test.rds"))
+```
+
+Confusion matrix/Class level eval 
+```{r}
+
+
+setDTthreads(percent = 100)
+validation_path <- here("Data","validation")
+dir.create(validation_path, recursive = TRUE, showWarnings = FALSE)
+
+psc_lev1 <- read_excel(here("Data", "psc_to_categories_2020_10_01.xlsx"), skip = 2)
+psc_lev1 <- clean_names(psc_lev1)
+
+lev1_dt <- as.data.table(psc_lev1)
+lev1_dt[, psc4 := toupper(gsub("[^A-Z0-9]", "", x4_digit_psc))]
+lev1_dt <- lev1_dt[nchar(psc4) == 4]
+lev1_dt[, psc2 := substr(psc4, 1, 2)]
+lev1_dt[, level_1_category := str_squish(str_to_sentence(as.character(level_1_category)))]
+
+
+pairs_uniq <- unique(lev1_dt[, .(psc4, psc2, level_1_category)])
+counts <- pairs_uniq[, .N, by = .(psc2, level_1_category)]
+counts[, name_len := nchar(level_1_category)]
+setorder(counts, psc2, -N, -name_len, level_1_category)
+psc2_l1 <- counts[, .SD[1L], by = psc2][, .(psc2, level_1_category)]
+
+saveRDS(psc2_l1, here(validation_path, "psc2_l1_map.rds"))
+
+
+truth_dt <- as.data.table(unique(usa_base[, c("pair_key_test","psc2_true")]))
+truth_dt[, psc2_true := substr(gsub("[^A-Z0-9]", "", toupper(psc2_true)), 1, 2)]
+truth_dt <- truth_dt[nchar(psc2_true) == 2]
+truth_dt <- psc2_l1[truth_dt, on = c("psc2" = "psc2_true")]
+setnames(truth_dt, "level_1_category", "true_l1")
+truth_dt[is.na(true_l1) | !nzchar(true_l1), true_l1 := "Unknown"]
+
+pred1 <- as.data.table(family_pick_test)
+pred1 <- pred1[rank == 1L]
+pred1[, psc2 := substr(gsub("[^A-Z0-9]", "", toupper(psc2)), 1, 2)]
+pred1 <- pred1[nchar(psc2) == 2]
+pred1 <- psc2_l1[pred1, on = "psc2"]
+setnames(pred1, "level_1_category", "pred_l1")
+pred1 <- unique(pred1[, .(pair_key_test, pred_l1)])
+pred1[is.na(pred_l1) | !nzchar(pred_l1), pred_l1 := "Unknown"]
+
+eval_dt <- truth_dt[pred1, on = "pair_key_test"]
+eval_dt <- eval_dt[!is.na(true_l1) & !is.na(pred_l1)]
+
+classes <- sort(unique(c(eval_dt$true_l1, eval_dt$pred_l1)))
+cm_long <- eval_dt[, .N, by = .(true_l1, pred_l1)]
+cm_long <- cm_long[CJ(true_l1 = classes, pred_l1 = classes, unique = TRUE), on = .(true_l1, pred_l1)]
+cm_long[is.na(N), N := 0L]
+
+cm_wide <- dcast(cm_long, true_l1 ~ pred_l1, value.var = "N")
+rn <- cm_wide$true_l1
+M <- as.matrix(cm_wide[, -1])
+rownames(M) <- rn
+# ensure columns ordered like rows
+M <- M[, rn, drop = FALSE]
+
+tp <- diag(M)
+row_sum <- rowSums(M)
+col_sum <- colSums(M)
+
+per_class <- data.table(
+  class     = rn,
+  TP        = as.integer(tp),
+  row_sum   = as.integer(row_sum),
+  col_sum   = as.integer(col_sum)
+)
+per_class[, Precision := fifelse(col_sum > 0, TP/col_sum, 0)]
+per_class[, Recall    := fifelse(row_sum > 0, TP/row_sum, 0)]
+per_class[, F1 := fifelse(Precision + Recall > 0, 2*Precision*Recall/(Precision + Recall), 0)]
+setorder(per_class, -row_sum, class)
+
+overall_acc <- sum(tp) / sum(M)
+macro_prec  <- mean(per_class$Precision)
+macro_rec   <- mean(per_class$Recall)
+macro_f1    <- mean(per_class$F1)
+w           <- per_class$row_sum / sum(per_class$row_sum)
+w_prec      <- sum(w * per_class$Precision)
+w_rec       <- sum(w * per_class$Recall)
+w_f1        <- sum(w * per_class$F1)
+
+
+overall_tbl <- data.table(
+  metric = c("accuracy_overall","macro_precision","macro_recall","macro_f1","weighted_precision","weighted_recall","weighted_f1","n_obs"),
+  value = c(overall_acc, macro_prec, macro_rec, macro_f1, w_prec, w_rec, w_f1, nrow(eval_dt))
+)
+saveRDS(overall_tbl, here(metrics_path, "overall_l1_metrics.rds"))
+fwrite(overall_tbl, here(metrics_path, "overall_l1_metrics.csv"))
+
+topk_dt <- as.data.table(family_scores_test)
+topk_dt[, psc2 := substr(gsub("[^A-Z0-9]", "", toupper(psc2)), 1, 2)]
+topk_dt <- topk_dt[nchar(psc2) == 2]
+topk_dt <- psc2_l1[topk_dt, on = "psc2"]
+setnames(topk_dt, "level_1_category", "pred_l1")
+topk_dt <- unique(topk_dt[, .(pair_key_test, pred_l1)])
+
+truth_topk <- unique(truth_dt[, .(pair_key_test, true_l1)])
+hits_top5 <- topk_dt[truth_topk, on = "pair_key_test", allow.cartesian = TRUE]
+hits_top5[, hit := as.integer(pred_l1 == true_l1)]
+hit_by_pair <- hits_top5[, .(hit5 = max(hit, na.rm = TRUE)), by = pair_key_test]
+hit_by_pair[!is.finite(hit5), hit5 := 0L]
+recall5_overall <- mean(hit_by_pair$hit5)
+recall5_by_l1 <- hits_top5[, .(hit5 = max(hit, na.rm = TRUE)), by = .(pair_key_test, true_l1)][, .(recall_at5 = mean(hit5)), by = true_l1]
+saveRDS(recall5_by_l1, here(metrics_path, "recall_at5_by_l1.rds"))
+fwrite(recall5_by_l1, here(metrics_path, "recall_at5_by_l1.csv"))
+recall5_tbl <- data.table(metric = c("recall_at5_overall"), value = c(recall5_overall))
+saveRDS(recall5_tbl, here(metrics_path, "recall_at5_overall.rds"))
+fwrite(recall5_tbl, here(metrics_path, "recall_at5_overall.csv"))
+
+
+scores2 <- as.data.table(family_scores_test)
+scores2 <- scores2[, psc2 := substr(gsub("[^A-Z0-9]", "", toupper(psc2)), 1, 2)]
+scores2 <- scores2[nchar(psc2) == 2]
+scores2 <- psc2_l1[scores2, on = "psc2"]
+setnames(scores2, "level_1_category", "pred_l1")
+
+truth_l1 <- unique(usa_base[, .(pair_key_test, psc2_true)])
+truth_l1[, psc2_true := substr(gsub("[^A-Z0-9]", "", toupper(psc2_true)), 1, 2)]
+truth_l1 <- psc2_l1[truth_l1, on = c("psc2" = "psc2_true")]
+setnames(truth_l1, "level_1_category", "true_l1")
+
+rec2_dt <- scores2[rank <= 2]
+rec2_dt <- rec2_dt[truth_l1, on = "pair_key_test"]
+rec2_dt[, hit2 := as.integer(pred_l1 == true_l1)]
+recall_at2 <- rec2_dt[, .(hit = max(hit2, na.rm = TRUE)), by = pair_key_test][, mean(hit, na.rm = TRUE)]
+
+
+
+
+```
+
+to do today: 
+run validation script on the full DoD data, get token predictors 
+handcode more: 
+ 1. confusion matrix for top 1 category 
+ 2. precision/recall for major groups
+
+
+plan today: 
+- redo embeddings on combo set of labeled/unlabeled data with more dimensions 
+- parsimonious token selection model
+- improve IT precision/accuracy (run on larger test set?)
+
+First, I combine the predictors that I created: the BM25 score, embedding similarity score, UEI prior, NAICS prior, API prediction and the query prior. I have a handcoded set of 200 observations which I use to assign the weights to the predictors, then I test the accurary.
+Next, I open up to the full set of primary contracts. This is a labeled dataset. First, I take a subset of the data and reconstruct the predictors that I use in my classification model for the subcontracts.I use this as a test of my model accuracy, with slight changes to the weights due to omission of API predictor on this data (computationally infeisable). 
+- To this, add a confusion matrix for the major groups and precision/recall 
+Then, I use all of the data (42 million observations) to train a highly regularized categorization model. The idea is to pick up on top words emblematic of a PSC2 category that we not captured in the other semantic predictors, like BM25, embeddings, or API. Why? The embeddings were unexpectedly weak, this could because the queries are short and many descriptions can be unapproachable, like long serial codes. Maybe with significantly more dimension or training data, the embedding would have performed better. BM25 is excellent with matching keywords, but we don't always have the precise needed keyword. The API is a black box but again can be noisy. Ideally, these token features will help us make better predictions, I see them as solving problems illustrated in 2 examples below: 
+1. The software problem. BM25 clearly directs the keyword "software" into the IT category (good), but the words "windows" or "apple" are directed into construction and food respectively. LASSO should have these words as strong predictors of IT categories. 
+2. The masonry problem. There are a bunch of queries that just said "masonry", which should be in a construction category, but the predictions were very noisy because that particular word was not in title description and I guess wasn't embedded either. 
+Ultimately, there are some words that we strongly associate with certain categories that methods so far haven't picked up yet; this should be a useful addition. 
+
+
+```{r}
+
+
+
+```
+
+
+
